@@ -685,6 +685,14 @@ def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN environment variable set nahi hai")
 
+    # ── Python 3.14 event-loop fix ──
+    # Python 3.14 mein main thread mein default event loop nahi hota,
+    # isliye run_polling() crash karta tha. Loop manually set karo.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     threading.Thread(target=run_flask, daemon=True).start()
     print(f"[boot] flask on port {os.environ.get('PORT', '5000')}")
     print(f"[boot] web_server_url = {WEB_SERVER_URL}")
