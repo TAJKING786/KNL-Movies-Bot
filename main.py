@@ -28,7 +28,7 @@ BOT_TOKEN          = os.environ.get("BOT_TOKEN", "")
 PUBLIC_CHANNEL_ID  = int(os.environ.get("PUBLIC_CHANNEL_ID", "0"))
 PRIVATE_CHANNEL_ID = int(os.environ.get("PRIVATE_CHANNEL_ID", "0"))
 BOT_USERNAME       = os.environ.get("BOT_USERNAME", "").lstrip("@")
-BRAND              = os.environ.get("BRAND", "🎬 Movie Hub")
+BRAND              = os.environ.get("BRAND", "FlixOrange")
 LOG_ENTRIES        = os.environ.get("LOG_ENTRIES", "1") == "1"
 INITDATA_TTL       = int(os.environ.get("INITDATA_TTL", "86400"))
 
@@ -46,7 +46,7 @@ def _admin_ids():
 ADMIN_IDS = _admin_ids()
 LINE = "──────────────────────"
 SNAP_MARK = "KNLDB"
-SNAP_VER = 3
+SNAP_VER = 4
 
 DB = {"movies": {}}
 STORAGE = {"ok": False, "source": "none", "saved_at": 0, "error": ""}
@@ -116,6 +116,11 @@ async def load_snapshot(bot) -> None:
         STORAGE["error"] = "Snapshot corrupt"
         return
 
+    for mid, m in movies.items():
+        m.setdefault("id", mid)
+        for k, v in DEFAULTS.items():
+            m.setdefault(k, v() if callable(v) else v)
+
     DB["movies"] = movies
     _snap_msg_id = pm.message_id
     STORAGE.update({
@@ -146,12 +151,9 @@ async def save_snapshot(bot) -> dict:
 
         try:
             msg = await bot.send_document(
-                chat_id=PRIVATE_CHANNEL_ID,
-                document=bio,
-                filename="library.json",
-                caption=caption,
-                write_timeout=60,
-                read_timeout=60,
+                chat_id=PRIVATE_CHANNEL_ID, document=bio,
+                filename="library.json", caption=caption,
+                write_timeout=60, read_timeout=60,
             )
         except Exception as exc:
             STORAGE["error"] = f"Snapshot upload fail: {exc}"
@@ -178,8 +180,7 @@ async def save_snapshot(bot) -> dict:
                 print("[storage] old snapshot delete:", exc)
 
         STORAGE.update({
-            "ok": pinned,
-            "source": "pinned-snapshot",
+            "ok": pinned, "source": "pinned-snapshot",
             "saved_at": payload["saved_at"],
             "error": "" if pinned else STORAGE["error"],
         })
@@ -207,45 +208,124 @@ async def _delayed_save(delay: float):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  MOVIE OPS
+#  SCHEMA
 # ═══════════════════════════════════════════════════════════════
+
+DEFAULTS = {
+    "name": "Untitled", "link": "", "size": "-", "quality": "-",
+    "poster": "", "backdrop": "", "type": "movie",
+    "genres": list, "year": 0, "rating": 0.0, "age": "",
+    "duration": "", "language": "", "description": "", "cast": list,
+}
+
+
+def _as_list(val):
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if str(x).strip()]
+    if isinstance(val, str):
+        return [p.strip() for p in val.replace(";", ",").split(",") if p.strip()]
+    return []
+
 
 def clean_fields(data: dict):
     name = str(data.get("name", "")).strip()
     link = str(data.get("link", "")).strip()
-    size = str(data.get("size", "-")).strip() or "-"
-    quality = str(data.get("quality", "-")).strip() or "-"
-    poster = str(data.get("poster", "")).strip()
     if not name:
         return None, "Name khali hai"
     if not link.startswith(("http://", "https://", "tg://")):
         return None, "Link http(s) se shuru hona chahiye"
-    if poster and not poster.startswith(("http://", "https://")):
-        return None, "Poster URL http(s) hona chahiye"
-    return {"name": name, "link": link, "size": size,
-            "quality": quality, "poster": poster}, None
 
+    poster = str(data.get("poster", "")).strip()
+    backdrop = str(data.get("backdrop", "")).strip()
+    for label, url in (("Poster", poster), ("Backdrop", backdrop)):
+        if url and not url.startswith(("http://", "https://")):
+            return None, f"{label} URL http(s) hona chahiye"
+
+    try:
+        year = int(str(data.get("year") or 0).strip() or 0)
+    except ValueError:
+        year = 0
+    try:
+        rating = round(float(str(data.get("rating") or 0).strip() or 0), 1)
+    except ValueError:
+        rating = 0.0
+    rating = max(0.0, min(10.0, rating))
+
+    mtype = str(data.get("type", "movie")).strip().lower()
+    if mtype not in ("movie", "series"):
+        mtype = "movie"
+
+    return {
+        "name": name,
+        "link": link,
+        "size": str(data.get("size", "-")).strip() or "-",
+        "quality": str(data.get("quality", "-")).strip() or "-",
+        "poster": poster,
+        "backdrop": backdrop,
+        "type": mtype,
+        "genres": _as_list(data.get("genres")),
+        "year": year,
+        "rating": rating,
+        "age": str(data.get("age", "")).strip(),
+        "duration": str(data.get("duration", "")).strip(),
+        "language": str(data.get("language", "")).strip(),
+        "description": str(data.get("description", "")).strip(),
+        "cast": _as_list(data.get("cast")),
+    }, None
+
+
+def public_view(m: dict) -> dict:
+    """Catalog payload — download link included nahi hota."""
+    return {
+        "id": m["id"], "name": m.get("name", "Untitled"),
+        "size": m.get("size", "-"), "quality": m.get("quality", "-"),
+        "poster": m.get("poster", ""), "backdrop": m.get("backdrop", ""),
+        "type": m.get("type", "movie"), "genres": m.get("genres", []),
+        "year": m.get("year", 0), "rating": m.get("rating", 0.0),
+        "age": m.get("age", ""), "duration": m.get("duration", ""),
+        "language": m.get("language", ""), "description": m.get("description", ""),
+        "cast": m.get("cast", []), "created": m.get("created", 0),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CHANNEL POST
+# ═══════════════════════════════════════════════════════════════
 
 async def post_public(bot, movie: dict) -> int:
     deep = (
         f"https://t.me/{BOT_USERNAME}?start=movie_{movie['id']}"
         if BOT_USERNAME else ""
     )
+    bits = []
+    if movie.get("year"):
+        bits.append(str(movie["year"]))
+    if movie.get("rating"):
+        bits.append(f"⭐ {movie['rating']}")
+    if movie.get("duration"):
+        bits.append(movie["duration"])
+    meta = " • ".join(bits)
+
     caption = (
         f"🎬 *{md(movie['name'])}*\n"
         f"{LINE}\n"
         f"📦 Size : {md(movie['size'])}\n"
         f"🎞 Quality : {md(movie['quality'])}\n"
-        f"{LINE}\n"
-        "⬇️ Download ke liye button dabayein"
     )
+    if meta:
+        caption += f"📅 {md(meta)}\n"
+    if movie.get("genres"):
+        caption += f"🏷 {md(', '.join(movie['genres']))}\n"
+    caption += f"{LINE}\n⬇️ Download ke liye button dabayein"
+
     kb = (
         InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ DOWNLOAD", url=deep)]])
         if deep else None
     )
-    if movie.get("poster"):
+    image = movie.get("backdrop") or movie.get("poster")
+    if image:
         m = await bot.send_photo(
-            PUBLIC_CHANNEL_ID, photo=movie["poster"], caption=caption,
+            PUBLIC_CHANNEL_ID, photo=image, caption=caption,
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb,
         )
     else:
@@ -269,6 +349,10 @@ async def log_entry(bot, movie: dict) -> int:
     m = await bot.send_message(PRIVATE_CHANNEL_ID, text)
     return m.message_id
 
+
+# ═══════════════════════════════════════════════════════════════
+#  OPS
+# ═══════════════════════════════════════════════════════════════
 
 async def op_add(data: dict) -> dict:
     fields, err = clean_fields(data)
@@ -296,7 +380,6 @@ async def op_add(data: dict) -> dict:
     st = await save_snapshot(BOT)
     if not st.get("ok"):
         warns.append(st.get("error") or "Snapshot pin nahi hua")
-
     return {"movie": movie, "warnings": warns}
 
 
@@ -354,44 +437,42 @@ async def op_repost(data: dict) -> dict:
             await BOT.delete_message(PUBLIC_CHANNEL_ID, old)
         except Exception:
             pass
-
     movie["public_msg_id"] = await post_public(BOT, movie)
     await save_snapshot(BOT)
     return {"movie": movie, "warnings": []}
 
 
 async def op_import(text: str) -> dict:
-    """Purane #MOVIE messages se restore — original ID preserve hoti hai."""
     fields = {}
     for line in text.splitlines()[1:]:
         if ":" in line:
             k, v = line.split(":", 1)
             fields[k.strip().upper()] = v.strip()
 
-    mid = fields.get("ID")
-    link = fields.get("LINK")
+    mid, link = fields.get("ID"), fields.get("LINK")
     if not mid or not link:
         raise ValueError("ID / LINK missing")
 
     poster = fields.get("POSTER", "-")
     existed = mid in DB["movies"]
-    movie = DB["movies"].get(mid, {"id": mid, "created": now()})
+    movie = DB["movies"].get(mid)
+    if not movie:
+        movie = {"id": mid, "created": now(),
+                 "log_msg_id": None, "public_msg_id": None}
+        for k, v in DEFAULTS.items():
+            movie.setdefault(k, v() if callable(v) else v)
     movie.update({
-        "name": fields.get("NAME", "Untitled"),
-        "link": link,
-        "size": fields.get("SIZE", "-"),
-        "quality": fields.get("QUALITY", "-"),
+        "name": fields.get("NAME", "Untitled"), "link": link,
+        "size": fields.get("SIZE", "-"), "quality": fields.get("QUALITY", "-"),
         "poster": "" if poster in ("-", "") else poster,
     })
-    movie.setdefault("log_msg_id", None)
-    movie.setdefault("public_msg_id", None)
     DB["movies"][mid] = movie
     schedule_save()
     return {"id": mid, "updated": existed}
 
 
 # ═══════════════════════════════════════════════════════════════
-#  TELEGRAM initData VALIDATION
+#  initData VALIDATION
 # ═══════════════════════════════════════════════════════════════
 
 def validate_init_data(init_data: str):
@@ -399,7 +480,6 @@ def validate_init_data(init_data: str):
         return None, "initData missing — app Telegram ke andar kholen"
     if not BOT_TOKEN:
         return None, "BOT_TOKEN set nahi hai"
-
     try:
         pairs = dict(parse_qsl(init_data, keep_blank_values=True))
     except Exception:
@@ -412,7 +492,6 @@ def validate_init_data(init_data: str):
     dcs = "\n".join(f"{k}={pairs[k]}" for k in sorted(pairs))
     secret = hmac.new(b"WebAppData", BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
     calc = hmac.new(secret, dcs.encode("utf-8"), hashlib.sha256).hexdigest()
-
     if not hmac.compare_digest(calc, recv_hash):
         return None, "signature invalid"
 
@@ -431,7 +510,6 @@ def validate_init_data(init_data: str):
             user = {}
     if not user.get("id"):
         return None, "user id missing"
-
     return {"user": user, "auth_date": auth_date}, None
 
 
@@ -481,7 +559,7 @@ async def get_channel_link(bot) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  FLASK — MINI APP + API
+#  FLASK
 # ═══════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
@@ -495,10 +573,8 @@ def mini_app():
             body = f.read()
     except OSError:
         return "app.html missing", 500
-    return body, 200, {
-        "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "no-store",
-    }
+    return body, 200, {"Content-Type": "text/html; charset=utf-8",
+                       "Cache-Control": "no-store"}
 
 
 @app.route("/health")
@@ -508,20 +584,13 @@ def health():
 
 @app.route("/api/movies")
 def api_movies():
-    items = [
-        {
-            "id": mid,
-            "name": m.get("name", "Untitled"),
-            "size": m.get("size", "-"),
-            "quality": m.get("quality", "-"),
-            "poster": m.get("poster", ""),
-            "created": m.get("created", 0),
-        }
-        for mid, m in DB["movies"].items()
-    ]
+    items = [public_view(m) for m in DB["movies"].values()]
     items.sort(key=lambda x: x.get("created", 0), reverse=True)
-    return jsonify({"ok": True, "brand": BRAND, "bot": BOT_USERNAME,
-                    "count": len(items), "movies": items})
+    genres = sorted({g for m in items for g in m.get("genres", [])})
+    return jsonify({
+        "ok": True, "brand": BRAND, "bot": BOT_USERNAME,
+        "count": len(items), "genres": genres, "movies": items,
+    })
 
 
 @app.route("/api/session", methods=["POST"])
@@ -533,9 +602,9 @@ def api_session():
     uid = int(auth["user"]["id"])
     return jsonify({
         "ok": True, "authed": True, "is_admin": uid in ADMIN_IDS,
-        "user": {"id": uid,
-                 "name": auth["user"].get("first_name", ""),
-                 "username": auth["user"].get("username", "")},
+        "user": {"id": uid, "name": auth["user"].get("first_name", ""),
+                 "username": auth["user"].get("username", ""),
+                 "photo": auth["user"].get("photo_url", "")},
         "brand": BRAND, "bot": BOT_USERNAME,
     })
 
@@ -560,9 +629,10 @@ def api_access():
         return jsonify({"ok": False, "error": f"Membership check fail: {exc}"}), 503
 
     if not is_member:
-        return jsonify({"ok": False, "need_join": True, "join_url": join_url})
+        return jsonify({"ok": True, "granted": False,
+                        "need_join": True, "join_url": join_url})
 
-    return jsonify({"ok": True, "link": movie["link"],
+    return jsonify({"ok": True, "granted": True, "link": movie["link"],
                     "name": movie["name"], "size": movie["size"],
                     "quality": movie["quality"]})
 
@@ -583,6 +653,8 @@ def api_admin_status():
         return err_resp
     return jsonify({
         "ok": True, "titles": len(DB["movies"]), "storage": STORAGE,
+        "movies_count": sum(1 for m in DB["movies"].values() if m.get("type") == "movie"),
+        "series_count": sum(1 for m in DB["movies"].values() if m.get("type") == "series"),
         "public_channel": bool(PUBLIC_CHANNEL_ID),
         "private_channel": bool(PRIVATE_CHANNEL_ID),
         "bot_username": BOT_USERNAME,
@@ -594,69 +666,42 @@ def api_admin_movies():
     _, err_resp = _admin_guard()
     if err_resp:
         return err_resp
-    items = list(DB["movies"].values())
-    items.sort(key=lambda x: x.get("created", 0), reverse=True)
+    items = sorted(DB["movies"].values(), key=lambda x: x.get("created", 0), reverse=True)
     return jsonify({"ok": True, "count": len(items), "movies": items})
+
+
+def _mutate(op):
+    _, err_resp = _admin_guard()
+    if err_resp:
+        return err_resp
+    body = request.get_json(silent=True) or {}
+    try:
+        result = bot_call(op(body), timeout=90)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, **result})
 
 
 @app.route("/api/admin/add", methods=["POST"])
 def api_admin_add():
-    _, err_resp = _admin_guard()
-    if err_resp:
-        return err_resp
-    body = request.get_json(silent=True) or {}
-    try:
-        result = bot_call(op_add(body), timeout=90)
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
-    return jsonify({"ok": True, **result})
+    return _mutate(op_add)
 
 
 @app.route("/api/admin/update", methods=["POST"])
 def api_admin_update():
-    _, err_resp = _admin_guard()
-    if err_resp:
-        return err_resp
-    body = request.get_json(silent=True) or {}
-    try:
-        result = bot_call(op_update(body), timeout=90)
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
-    return jsonify({"ok": True, **result})
+    return _mutate(op_update)
 
 
 @app.route("/api/admin/delete", methods=["POST"])
 def api_admin_delete():
-    _, err_resp = _admin_guard()
-    if err_resp:
-        return err_resp
-    body = request.get_json(silent=True) or {}
-    try:
-        result = bot_call(op_delete(body), timeout=90)
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
-    return jsonify({"ok": True, **result})
+    return _mutate(op_delete)
 
 
 @app.route("/api/admin/repost", methods=["POST"])
 def api_admin_repost():
-    _, err_resp = _admin_guard()
-    if err_resp:
-        return err_resp
-    body = request.get_json(silent=True) or {}
-    try:
-        result = bot_call(op_repost(body), timeout=90)
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-    except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
-    return jsonify({"ok": True, **result})
+    return _mutate(op_repost)
 
 
 def run_flask():
@@ -670,62 +715,51 @@ def run_flask():
 
 def movie_card(movie, status):
     return (
-        f"🎬 *{md(movie['name'])}*\n"
-        f"{LINE}\n"
+        f"🎬 *{md(movie['name'])}*\n{LINE}\n"
         f"📦 Size : {md(movie.get('size', '-'))}\n"
-        f"🎞 Quality : {md(movie.get('quality', '-'))}\n"
-        f"{LINE}\n"
-        f"{status}"
+        f"🎞 Quality : {md(movie.get('quality', '-'))}\n{LINE}\n{status}"
     )
 
 
 async def _send_or_edit(update: Update, text: str, keyboard):
     if update.callback_query:
         await update.callback_query.edit_message_text(
-            text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
-        )
+            text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
     else:
         await update.effective_message.reply_text(
-            text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
-        )
+            text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
 
 
 async def show_download(update: Update, movie: dict):
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬇️ Download Now", url=movie["link"])],
-        [InlineKeyboardButton("📚 More Movies", callback_data="browse")],
-    ])
-    await _send_or_edit(update, movie_card(movie, "✅ *Access granted*"), keyboard)
+    rows = [[InlineKeyboardButton("⬇️ Download Now", url=movie["link"])]]
+    if BOT_USERNAME:
+        rows.append([InlineKeyboardButton(
+            "🎬 Open App", url=f"https://t.me/{BOT_USERNAME}/app")])
+    await _send_or_edit(update, movie_card(movie, "✅ *Access granted*"),
+                        InlineKeyboardMarkup(rows))
 
 
 async def handle_movie_request(update: Update, context: ContextTypes.DEFAULT_TYPE, movie_id: str):
     movie = DB["movies"].get(movie_id)
     if not movie:
         await update.effective_message.reply_text(
-            f"⚠️ *Content unavailable*\n{LINE}\n"
-            "Yeh title library mein nahi mila.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+            f"⚠️ *Content unavailable*\n{LINE}\nYeh title library mein nahi mila.",
+            parse_mode=ParseMode.MARKDOWN)
         return
 
     uid = update.effective_user.id
     if not await check_membership(context.bot, uid):
         link = await get_channel_link(context.bot)
-        keyboard = InlineKeyboardMarkup([
+        kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("📢 Join Channel", url=link)],
             [InlineKeyboardButton("✅ I Joined", callback_data=f"join_{movie_id}")],
         ])
         await update.effective_message.reply_text(
-            "🔒 *MEMBERS ONLY*\n"
-            f"{LINE}\n"
-            f"🎬 {md(movie['name'])}\n\n"
-            "1️⃣ *Join Channel* dabayein\n"
-            "2️⃣ Channel join karein\n"
+            f"🔒 *MEMBERS ONLY*\n{LINE}\n🎬 {md(movie['name'])}\n\n"
+            "1️⃣ *Join Channel* dabayein\n2️⃣ Channel join karein\n"
             "3️⃣ *I Joined* se confirm karein",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard,
-        )
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
         return
-
     await show_download(update, movie)
 
 
@@ -738,21 +772,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await handle_movie_request(update, context, arg[len("movie_"):])
             return
         if arg in ("movies", "list"):
-            await render_list(update, edit=False)
+            await render_list(update, False)
             return
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📚 Browse Movies", callback_data="browse")],
-        [InlineKeyboardButton("❓ Help", callback_data="helpcb")],
-    ])
+    rows = [[InlineKeyboardButton("📚 Browse Library", callback_data="browse")]]
+    if BOT_USERNAME:
+        rows.insert(0, [InlineKeyboardButton(
+            "🎬 Open App", url=f"https://t.me/{BOT_USERNAME}/app")])
     await update.effective_message.reply_text(
         f"*{md(BRAND)}*\n{LINE}\n"
         f"Welcome, {md(update.effective_user.first_name or '')} 👋\n\n"
-        "Channel mein movie ka *DOWNLOAD* button dabayein —\n"
-        "join check ke baad link turant mil jayega.\n\n"
+        "App mein poori library browse karein, ya channel se\n"
+        "*DOWNLOAD* button dabayein — link turant milega.\n\n"
         "⚡ Members-only • Instant • No extra steps",
-        parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard,
-    )
+        parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -760,12 +793,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.effective_message.reply_text(
         f"*{md(BRAND)} — Help*\n{LINE}\n"
-        "1️⃣ Channel se DOWNLOAD dabayein\n"
-        "2️⃣ Channel join karein\n"
-        "3️⃣ Link turant mil jayega\n\n"
-        "📚 Library: /movies",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        "1️⃣ App ya channel se title chunein\n"
+        "2️⃣ Channel join karein (agar nahi kiya)\n"
+        "3️⃣ Download link turant mil jayega\n\n"
+        "📚 Library: /movies", parse_mode=ParseMode.MARKDOWN)
 
 
 async def render_list(update: Update, edit=False):
@@ -779,19 +810,15 @@ async def render_list(update: Update, edit=False):
         return
 
     items = sorted(movies.values(), key=lambda x: x.get("created", 0), reverse=True)
-    buttons = [
-        [InlineKeyboardButton(f"🎬 {m['name'][:38]}", callback_data=f"open_{m['id']}")]
-        for m in items[:40]
-    ]
+    buttons = [[InlineKeyboardButton(f"🎬 {m['name'][:38]}", callback_data=f"open_{m['id']}")]
+               for m in items[:40]]
     text = f"*{md(BRAND)} — Library*\n{LINE}\n📚 {len(movies)} titles\nSelect karein 👇"
     if edit:
         await update.callback_query.edit_message_text(
-            text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons)
-        )
+            text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
     else:
         await update.effective_message.reply_text(
-            text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons)
-        )
+            text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -803,27 +830,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "browse":
         await query.answer()
-        await render_list(update, edit=True)
-        return
-
-    if data == "helpcb":
-        await query.answer()
-        await query.edit_message_text(
-            f"*{md(BRAND)} — Help*\n{LINE}\n"
-            "1️⃣ Channel se DOWNLOAD dabayein\n"
-            "2️⃣ Channel join karein\n"
-            "3️⃣ Link turant mil jayega",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📚 Browse Movies", callback_data="browse")]
-            ]),
-        )
+        await render_list(update, True)
         return
 
     if data.startswith(("join_", "open_")):
         prefix = "join_" if data.startswith("join_") else "open_"
-        mid = data[len(prefix):]
-        movie = DB["movies"].get(mid)
+        movie = DB["movies"].get(data[len(prefix):])
         if not movie:
             await query.answer("⚠️ Content nahi mila", show_alert=True)
             return
@@ -841,6 +853,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #  BOT — ADMIN
 # ═══════════════════════════════════════════════════════════════
 
+PIPE_FIELDS = ["name", "link", "size", "quality", "poster", "backdrop",
+               "type", "genres", "year", "rating", "duration",
+               "language", "age", "cast", "description"]
+
+
 async def add_movie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_message:
         return
@@ -851,10 +868,12 @@ async def add_movie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = (update.effective_message.text or "").split(maxsplit=1)
     if len(raw) < 2 or "|" not in raw[1]:
         await update.effective_message.reply_text(
-            "*Usage*\n`/addmovie Name | link | size | quality | poster_url`\n\n"
-            "Poster optional hai.\n\n💡 Mini app ka Admin panel zyada aasan hai.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+            "*Quick add*\n`/addmovie Name | link | size | quality | poster`\n\n"
+            "*Full metadata* (app ka Admin panel aasan hai):\n"
+            "`/addmovie Name | link | size | quality | poster | backdrop | "
+            "type | genres | year | rating | duration | language | age | cast | description`\n\n"
+            "Ya JSON: `/addjson {\"name\":\"…\",\"link\":\"…\"}`",
+            parse_mode=ParseMode.MARKDOWN)
         return
 
     parts = [p.strip() for p in raw[1].split("|")]
@@ -862,9 +881,8 @@ async def add_movie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("⚠️ 4 fields chahiye: Name | link | size | quality")
         return
 
-    data = {"name": parts[0], "link": parts[1], "size": parts[2],
-            "quality": parts[3], "poster": parts[4] if len(parts) > 4 else "",
-            "post": True}
+    data = {k: parts[i] for i, k in enumerate(PIPE_FIELDS) if i < len(parts)}
+    data["post"] = True
     try:
         res = await op_add(data)
     except Exception as exc:
@@ -875,8 +893,30 @@ async def add_movie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     warn = ("\n\n⚠️ " + "\n⚠️ ".join(res["warnings"])) if res["warnings"] else ""
     await update.effective_message.reply_text(
         f"✅ *Added*\n{LINE}\n🎬 {md(m['name'])}\n🔖 `{m['id']}`{md(warn)}",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        parse_mode=ParseMode.MARKDOWN)
+
+
+async def add_json_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_message or update.effective_user.id not in ADMIN_IDS:
+        return
+    raw = (update.effective_message.text or "").split(maxsplit=1)
+    if len(raw) < 2:
+        await update.effective_message.reply_text('Usage: `/addjson {"name":"…","link":"…"}`',
+                                                  parse_mode=ParseMode.MARKDOWN)
+        return
+    try:
+        data = json.loads(raw[1])
+    except ValueError as exc:
+        await update.effective_message.reply_text(f"⚠️ JSON invalid: {exc}")
+        return
+    data["post"] = data.get("post", True)
+    try:
+        res = await op_add(data)
+    except Exception as exc:
+        await update.effective_message.reply_text(f"⚠️ {exc}")
+        return
+    await update.effective_message.reply_text(
+        f"✅ Added `{res['movie']['id']}`", parse_mode=ParseMode.MARKDOWN)
 
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -909,19 +949,14 @@ async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_message or update.effective_user.id not in ADMIN_IDS:
         return
-    saved = (
-        time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(STORAGE["saved_at"]))
-        if STORAGE["saved_at"] else "—"
-    )
+    saved = (time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(STORAGE["saved_at"]))
+             if STORAGE["saved_at"] else "—")
     await update.effective_message.reply_text(
-        f"📊 *Status*\n{LINE}\n"
-        f"🎬 Titles : {len(DB['movies'])}\n"
+        f"📊 *Status*\n{LINE}\n🎬 Titles : {len(DB['movies'])}\n"
         f"💾 Storage : {'✅ OK' if STORAGE['ok'] else '⚠️ Problem'}\n"
-        f"🕒 Last save : {saved}\n"
-        f"📌 Source : {STORAGE['source']}\n"
+        f"🕒 Last save : {saved}\n📌 Source : {STORAGE['source']}\n"
         + (f"\n⚠️ {md(STORAGE['error'])}" if STORAGE["error"] else ""),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        parse_mode=ParseMode.MARKDOWN)
 
 
 async def save_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -931,12 +966,10 @@ async def save_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"{'✅' if st['ok'] else '⚠️'} Snapshot save\n{LINE}\n"
         f"Titles: {len(DB['movies'])}\n{md(st.get('error') or 'Pinned + saved')}",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        parse_mode=ParseMode.MARKDOWN)
 
 
 async def import_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin dwara forward/paste kiye gaye #MOVIE entries import karo."""
     msg = update.effective_message
     if not msg or not update.effective_user:
         return
@@ -954,8 +987,7 @@ async def import_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await msg.reply_text(
         f"{'🔄 Updated' if res['updated'] else '✅ Imported'} `{res['id']}`",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+        parse_mode=ParseMode.MARKDOWN)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -987,9 +1019,7 @@ async def post_init(application: Application):
                     "Fix: bot ko private channel mein *Pin Messages* aur "
                     "*Delete Messages* rights do, phir /save bhejo.\n\n"
                     "Purani movies wapas laane ke liye unke `#MOVIE` messages "
-                    "yahan forward kar do.",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
+                    "yahan forward kar do.", parse_mode=ParseMode.MARKDOWN)
             except Exception:
                 pass
 
@@ -1007,11 +1037,11 @@ def main():
     print(f"[boot] flask port {os.environ.get('PORT', '5000')} | admins={sorted(ADMIN_IDS)}")
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("movies", lambda u, c: render_list(u, False)))
     application.add_handler(CommandHandler("addmovie", add_movie_cmd))
+    application.add_handler(CommandHandler("addjson", add_json_cmd))
     application.add_handler(CommandHandler("list", list_cmd))
     application.add_handler(CommandHandler("delmovie", del_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
