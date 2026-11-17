@@ -5,6 +5,7 @@ import html
 import io
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -34,6 +35,8 @@ WEB_APP_URL        = (os.environ.get("WEB_APP_URL", "")
                       or os.environ.get("RENDER_EXTERNAL_URL", "")).rstrip("/")
 LOG_ENTRIES        = os.environ.get("LOG_ENTRIES", "1") == "1"
 INITDATA_TTL       = int(os.environ.get("INITDATA_TTL", "86400"))
+KEEP_IDS           = int(os.environ.get("KEEP_IDS", "12"))
+BACKUP_EVERY       = int(os.environ.get("BACKUP_EVERY", "5"))
 
 
 def _admin_ids():
@@ -48,103 +51,258 @@ def _admin_ids():
 
 ADMIN_IDS = _admin_ids()
 
-# ── Message styling ──
 DIV   = "━" * 22
-WIDTH = "ㅤ" * 28          # invisible width-line: har bubble same width
+WIDTH = "ㅤ" * 28
 
 
-def h(text) -> str:
-    return html.escape(str(text if text is not None else ""), quote=False)
+def h(t) -> str:
+    return html.escape(str(t if t is not None else ""), quote=False)
 
 
-def frame(text: str) -> str:
-    return f"{text}\n{WIDTH}"
+def frame(t: str) -> str:
+    return f"{t}\n{WIDTH}"
 
 
 SNAP_MARK = "KNLDB"
-SNAP_VER = 4
+SNAP_VER  = 5
 
 DB = {"movies": {}}
-STORAGE = {"ok": False, "source": "none", "saved_at": 0, "error": ""}
+
+# ── Data-safety state ──
+LOAD = {
+    "state": "boot",        # boot | fresh | ok | failed
+    "baseline": 0,          # titles at successful load
+    "authorized_loss": 0,   # legit deletions since load
+    "source": "none",
+    "error": "",
+    "msg_id": None,
+    "saved_at": 0,
+    "last_backup": 0,
+}
+
 BOT = None
 MAIN_LOOP = None
-_snap_msg_id = None
 _save_lock = None
-_save_task = None
 
 
 def now() -> int:
     return int(time.time())
 
 
+def writable():
+    """Load fail hua hai toh likhna MANA hai — yahi data bachata hai."""
+    if LOAD["state"] in ("fresh", "ok"):
+        return True, ""
+    return False, (
+        "Database load nahi hua, isliye save BLOCKED hai (data protection). "
+        "Pehle /recover chalao ya purana library.json forward karo."
+    )
+
+
+def shrink_ok(new_count: int):
+    floor = max(0, LOAD["baseline"] - LOAD["authorized_loss"])
+    if new_count >= floor:
+        return True, ""
+    return False, (
+        f"Save BLOCKED: {new_count} titles likhne ja rahe the, lekin "
+        f"{floor} hone chahiye. Data loss rok diya gaya. "
+        f"/recover chalao, ya janbujh kar delete kiya hai to /save force."
+    )
+
+
 # ═══════════════════════════════════════════════════════════════
-#  STORAGE — pinned JSON snapshot in private channel
+#  SNAPSHOT PLUMBING
 # ═══════════════════════════════════════════════════════════════
 
-async def load_snapshot(bot) -> None:
-    global _snap_msg_id
-    STORAGE.update({"ok": False, "source": "none", "error": ""})
+def _desc_string(ids, count):
+    ids = [str(i) for i in ids if i][:KEEP_IDS]
+    return f"{SNAP_MARK} v{SNAP_VER} n={count} t={now()} ids={','.join(ids)}"
 
-    if not PRIVATE_CHANNEL_ID:
-        STORAGE["error"] = "PRIVATE_CHANNEL_ID set nahi hai"
-        print("[storage]", STORAGE["error"])
-        return
 
+def _parse_desc(desc):
+    if not desc or not desc.strip().startswith(SNAP_MARK):
+        return None
+    kv = {}
+    for tok in desc.split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            kv[k.strip()] = v.strip()
+    ids = [int(x) for x in kv.get("ids", "").split(",") if x.strip().isdigit()]
     try:
-        chat = await bot.get_chat(PRIVATE_CHANNEL_ID)
-    except Exception as exc:
-        STORAGE["error"] = f"getChat fail: {exc}"
-        print("[storage]", STORAGE["error"])
-        return
+        n = int(kv.get("n", "0") or 0)
+    except ValueError:
+        n = 0
+    return {"ids": ids, "n": n}
 
-    pm = chat.pinned_message
-    if not pm:
-        STORAGE["error"] = "Koi pinned message nahi — pehli movie add karte hi ban jayega"
-        print("[storage]", STORAGE["error"])
-        return
 
-    cap = (pm.caption or pm.text or "").strip()
-    if not pm.document or not cap.startswith(SNAP_MARK):
-        STORAGE["error"] = "Pinned message database snapshot nahi hai"
-        print("[storage]", STORAGE["error"])
-        return
+async def _download_doc(bot, document):
+    f = await bot.get_file(document.file_id)
+    raw = await f.download_as_bytearray()
+    return json.loads(bytes(raw).decode("utf-8"))
 
-    try:
-        tg_file = await bot.get_file(pm.document.file_id)
-        raw = await tg_file.download_as_bytearray()
-        payload = json.loads(bytes(raw).decode("utf-8"))
-    except Exception as exc:
-        STORAGE["error"] = f"Snapshot read fail: {exc}"
-        print("[storage]", STORAGE["error"])
-        return
 
-    movies = payload.get("movies") or {}
+async def _read_by_id(bot, mid):
+    """Channel ki purani message se document padho (forward trick)."""
+    targets = [PRIVATE_CHANNEL_ID] + sorted(ADMIN_IDS)
+    for dest in targets:
+        fwd = None
+        try:
+            fwd = await bot.forward_message(dest, PRIVATE_CHANNEL_ID, mid)
+            if not fwd.document:
+                continue
+            return await _download_doc(bot, fwd.document)
+        except Exception as exc:
+            print(f"[recover] id={mid} dest={dest}: {exc}")
+        finally:
+            if fwd is not None:
+                try:
+                    await bot.delete_message(dest, fwd.message_id)
+                except Exception:
+                    pass
+    return None
+
+
+def _normalize(payload):
+    movies = payload.get("movies")
     if not isinstance(movies, dict):
-        STORAGE["error"] = "Snapshot corrupt"
-        return
-
+        return None
     for mid, m in movies.items():
+        if not isinstance(m, dict):
+            continue
         m.setdefault("id", mid)
         for k, v in DEFAULTS.items():
             m.setdefault(k, v() if callable(v) else v)
-
-    DB["movies"] = movies
-    _snap_msg_id = pm.message_id
-    STORAGE.update({
-        "ok": True, "source": "pinned-snapshot",
-        "saved_at": int(payload.get("saved_at") or 0), "error": "",
-    })
-    print(f"[storage] {len(movies)} titles restored from pinned snapshot")
+    return movies
 
 
-async def save_snapshot(bot) -> dict:
-    global _snap_msg_id
+async def load_snapshot(bot, announce=True) -> dict:
+    """Pin → description chain → fail. Fail par DB ko chhua nahi jata."""
+    LOAD.update({"state": "boot", "error": "", "source": "none"})
+
     if not PRIVATE_CHANNEL_ID:
-        STORAGE["error"] = "PRIVATE_CHANNEL_ID set nahi hai"
-        return dict(STORAGE)
+        LOAD.update({"state": "failed", "error": "PRIVATE_CHANNEL_ID set nahi hai"})
+        return dict(LOAD)
+
+    chat = None
+    for attempt in range(3):
+        try:
+            chat = await bot.get_chat(PRIVATE_CHANNEL_ID)
+            break
+        except Exception as exc:
+            print(f"[load] getChat attempt {attempt+1}: {exc}")
+            await asyncio.sleep(1.5 * (attempt + 1))
+
+    if chat is None:
+        LOAD.update({"state": "failed",
+                     "error": "Channel reachable nahi (getChat fail). Save blocked."})
+        return dict(LOAD)
+
+    candidates = []
+
+    pm = chat.pinned_message
+    if pm and pm.document and (pm.caption or "").strip().startswith(SNAP_MARK):
+        candidates.append(("pinned", pm.message_id, pm.document))
+
+    desc_info = _parse_desc(chat.description or "")
+    if desc_info:
+        for mid in desc_info["ids"]:
+            if pm and mid == pm.message_id:
+                continue
+            candidates.append(("description", mid, None))
+
+    if not candidates:
+        DB["movies"] = {}
+        LOAD.update({"state": "fresh", "baseline": 0, "authorized_loss": 0,
+                     "source": "fresh", "msg_id": None, "saved_at": 0})
+        print("[load] fresh database")
+        return dict(LOAD)
+
+    for source, mid, doc in candidates:
+        try:
+            payload = await _download_doc(bot, doc) if doc else await _read_by_id(bot, mid)
+            if not payload:
+                continue
+            movies = _normalize(payload)
+            if movies is None:
+                continue
+            DB["movies"] = movies
+            LOAD.update({
+                "state": "ok", "baseline": len(movies), "authorized_loss": 0,
+                "source": source, "msg_id": mid,
+                "saved_at": int(payload.get("saved_at") or 0), "error": "",
+            })
+            print(f"[load] {len(movies)} titles via {source} (msg {mid})")
+            if source != "pinned":
+                await _repoint(bot, mid, len(movies))
+            return dict(LOAD)
+        except Exception as exc:
+            print(f"[load] {source} msg={mid}: {exc}")
+
+    LOAD.update({
+        "state": "failed",
+        "error": "Snapshot pointers mile lekin koi padha nahi gaya. Save blocked.",
+    })
+    if announce:
+        await alert_admins(
+            f"🚨 <b>DATA PROTECTION ACTIVE</b>\n{DIV}\n"
+            f"{h(LOAD['error'])}\n\n"
+            f"<blockquote>Purana data safe hai — bot kuch overwrite nahi karega.\n\n"
+            f"Fix:\n"
+            f"1️⃣ /recover chalao\n"
+            f"2️⃣ Ya private channel se koi purana <code>library.json</code> "
+            f"yahan forward kar do</blockquote>"
+        )
+    return dict(LOAD)
+
+
+async def _repoint(bot, mid, count):
+    """Pin + description dono ko ek valid snapshot par le jao."""
+    try:
+        await bot.pin_chat_message(PRIVATE_CHANNEL_ID, mid, disable_notification=True)
+    except Exception as exc:
+        print("[repoint] pin:", exc)
+    try:
+        chat = await bot.get_chat(PRIVATE_CHANNEL_ID)
+        info = _parse_desc(chat.description or "") or {"ids": []}
+        ids = [mid] + [i for i in info["ids"] if i != mid]
+        await bot.set_chat_description(PRIVATE_CHANNEL_ID, _desc_string(ids, count))
+    except Exception as exc:
+        print("[repoint] description:", exc)
+
+
+async def save_snapshot(bot, force=False) -> dict:
+    ok, why = writable()
+    if not ok and not force:
+        LOAD["error"] = why
+        return {"ok": False, "error": why, "blocked": True}
+
+    ok, why = shrink_ok(len(DB["movies"]))
+    if not ok and not force:
+        LOAD["error"] = why
+        await alert_admins(f"🛑 <b>SAVE BLOCKED</b>\n{DIV}\n{h(why)}")
+        return {"ok": False, "error": why, "blocked": True}
+
+    if not PRIVATE_CHANNEL_ID:
+        return {"ok": False, "error": "PRIVATE_CHANNEL_ID set nahi hai"}
 
     async with _save_lock:
-        payload = {"v": SNAP_VER, "saved_at": now(), "movies": DB["movies"]}
+        prev_ids = []
+        try:
+            chat = await bot.get_chat(PRIVATE_CHANNEL_ID)
+            info = _parse_desc(chat.description or "")
+            if info:
+                prev_ids = info["ids"]
+        except Exception:
+            pass
+        if LOAD.get("msg_id") and LOAD["msg_id"] not in prev_ids:
+            prev_ids.insert(0, LOAD["msg_id"])
+
+        payload = {
+            "v": SNAP_VER, "saved_at": now(),
+            "count": len(DB["movies"]),
+            "prev": prev_ids[:KEEP_IDS],
+            "movies": DB["movies"],
+        }
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         bio = io.BytesIO(raw)
         bio.name = "library.json"
@@ -153,61 +311,109 @@ async def save_snapshot(bot) -> dict:
             f"Titles: {len(DB['movies'])}\n"
             f"Saved: {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC"
         )
+
         try:
             msg = await bot.send_document(
                 chat_id=PRIVATE_CHANNEL_ID, document=bio,
                 filename="library.json", caption=caption,
-                write_timeout=60, read_timeout=60,
+                write_timeout=90, read_timeout=90,
             )
         except Exception as exc:
-            STORAGE["error"] = f"Snapshot upload fail: {exc}"
-            print("[storage]", STORAGE["error"])
-            return dict(STORAGE)
+            LOAD["error"] = f"Upload fail: {exc}"
+            return {"ok": False, "error": LOAD["error"]}
 
-        pinned = False
+        # Verify: jo likha wahi padh paa rahe hain?
+        verified = False
         try:
-            await bot.pin_chat_message(
-                PRIVATE_CHANNEL_ID, msg.message_id, disable_notification=True
-            )
+            back = await _download_doc(bot, msg.document)
+            verified = len(_normalize(back) or {}) == len(DB["movies"])
+        except Exception as exc:
+            print("[save] verify:", exc)
+
+        if not verified:
+            LOAD["error"] = "Verify fail — pin nahi kiya, purana snapshot safe hai"
+            await alert_admins(f"⚠️ <b>SAVE VERIFY FAILED</b>\n{DIV}\n"
+                               f"Naya file corrupt tha. Purana data untouched.")
+            return {"ok": False, "error": LOAD["error"]}
+
+        ids = [msg.message_id] + [i for i in prev_ids if i != msg.message_id]
+        pinned, desc_ok = False, False
+        try:
+            await bot.pin_chat_message(PRIVATE_CHANNEL_ID, msg.message_id,
+                                       disable_notification=True)
             pinned = True
         except Exception as exc:
-            STORAGE["error"] = f"Pin fail (bot ko 'Pin Messages' right do): {exc}"
-            print("[storage]", STORAGE["error"])
+            print("[save] pin:", exc)
+        try:
+            await bot.set_chat_description(PRIVATE_CHANNEL_ID,
+                                           _desc_string(ids, len(DB["movies"])))
+            desc_ok = True
+        except Exception as exc:
+            print("[save] description:", exc)
 
-        old = _snap_msg_id
-        _snap_msg_id = msg.message_id
-        if pinned and old and old != msg.message_id:
-            try:
-                await bot.delete_message(PRIVATE_CHANNEL_ID, old)
-            except Exception as exc:
-                print("[storage] old snapshot delete:", exc)
-
-        STORAGE.update({
-            "ok": pinned, "source": "pinned-snapshot",
-            "saved_at": payload["saved_at"],
-            "error": "" if pinned else STORAGE["error"],
+        # Purane snapshots DELETE NAHI hote — archive rehta hai
+        LOAD.update({
+            "state": "ok", "baseline": len(DB["movies"]), "authorized_loss": 0,
+            "source": "pinned-snapshot", "msg_id": msg.message_id,
+            "saved_at": payload["saved_at"], "error": "",
         })
-        print(f"[storage] saved {len(DB['movies'])} titles | pinned={pinned}")
-        return dict(STORAGE)
+        if not pinned and not desc_ok:
+            LOAD["error"] = ("Pin aur description dono fail — bot ko 'Pin Messages' + "
+                             "'Change Channel Info' rights do")
+            await alert_admins(f"🚨 <b>POINTER FAIL</b>\n{DIV}\n{h(LOAD['error'])}\n\n"
+                               f"<blockquote>Data channel mein safe hai "
+                               f"(msg <code>{msg.message_id}</code>), lekin agle boot par "
+                               f"auto-load nahi hoga. Rights fix karo phir /save.</blockquote>")
+
+        print(f"[save] {len(DB['movies'])} titles | pin={pinned} desc={desc_ok}")
+
+        if len(DB["movies"]) - LOAD["last_backup"] >= BACKUP_EVERY:
+            await dm_backup(bot)
+            LOAD["last_backup"] = len(DB["movies"])
+
+        return {"ok": True, "pinned": pinned, "description": desc_ok,
+                "msg_id": msg.message_id, "error": LOAD["error"]}
 
 
-def schedule_save(delay: float = 3.0) -> None:
-    global _save_task
-    if MAIN_LOOP is None:
+async def dm_backup(bot):
+    if not ADMIN_IDS:
         return
-    if _save_task and not _save_task.done():
-        _save_task.cancel()
-    _save_task = MAIN_LOOP.create_task(_delayed_save(delay))
+    raw = json.dumps({"v": SNAP_VER, "saved_at": now(), "movies": DB["movies"]},
+                     ensure_ascii=False, indent=1).encode("utf-8")
+    for aid in ADMIN_IDS:
+        try:
+            bio = io.BytesIO(raw)
+            bio.name = "library.json"
+            await bot.send_document(
+                aid, document=bio, filename="library.json",
+                caption=(f"{SNAP_MARK} backup\nTitles: {len(DB['movies'])}\n"
+                         f"Restore: is file ko bot mein forward kar do."),
+                write_timeout=90, read_timeout=90,
+            )
+        except Exception as exc:
+            print("[backup]", aid, exc)
 
 
-async def _delayed_save(delay: float):
-    try:
-        await asyncio.sleep(delay)
-        await save_snapshot(BOT)
-    except asyncio.CancelledError:
-        pass
-    except Exception as exc:
-        print("[storage] delayed save:", exc)
+async def alert_admins(text):
+    if BOT is None:
+        return
+    for aid in ADMIN_IDS:
+        try:
+            await BOT.send_message(aid, frame(text), parse_mode=ParseMode.HTML,
+                                   disable_web_page_preview=True)
+        except Exception:
+            pass
+
+
+async def restore_payload(bot, payload, label="forwarded file"):
+    movies = _normalize(payload)
+    if movies is None:
+        raise ValueError("File mein valid 'movies' data nahi hai")
+    before = len(DB["movies"])
+    DB["movies"] = movies
+    LOAD.update({"state": "ok", "baseline": len(movies), "authorized_loss": 0})
+    res = await save_snapshot(bot, force=True)
+    return {"restored": len(movies), "before": before, "save": res, "label": label}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -237,13 +443,11 @@ def clean_fields(data: dict):
         return None, "Name khali hai"
     if not link.startswith(("http://", "https://", "tg://")):
         return None, "Link http(s) se shuru hona chahiye"
-
     poster = str(data.get("poster", "")).strip()
     backdrop = str(data.get("backdrop", "")).strip()
     for label, url in (("Poster", poster), ("Backdrop", backdrop)):
         if url and not url.startswith(("http://", "https://")):
             return None, f"{label} URL http(s) hona chahiye"
-
     try:
         year = int(str(data.get("year") or 0).strip() or 0)
     except ValueError:
@@ -253,11 +457,9 @@ def clean_fields(data: dict):
     except ValueError:
         rating = 0.0
     rating = max(0.0, min(10.0, rating))
-
     mtype = str(data.get("type", "movie")).strip().lower()
     if mtype not in ("movie", "series"):
         mtype = "movie"
-
     return {
         "name": name, "link": link,
         "size": str(data.get("size", "-")).strip() or "-",
@@ -285,6 +487,12 @@ def public_view(m: dict) -> dict:
     }
 
 
+def guard_or_raise():
+    ok, why = writable()
+    if not ok:
+        raise ValueError(why)
+
+
 # ═══════════════════════════════════════════════════════════════
 #  CHANNEL POST
 # ═══════════════════════════════════════════════════════════════
@@ -301,14 +509,10 @@ def movie_meta_line(m: dict) -> str:
 
 
 async def post_public(bot, movie: dict) -> int:
-    deep = (
-        f"https://t.me/{BOT_USERNAME}?start=movie_{movie['id']}"
-        if BOT_USERNAME else ""
-    )
+    deep = f"https://t.me/{BOT_USERNAME}?start=movie_{movie['id']}" if BOT_USERNAME else ""
     meta = movie_meta_line(movie)
     caption = (
-        f"🎬 <b>{h(movie['name'])}</b>\n"
-        f"{DIV}\n"
+        f"🎬 <b>{h(movie['name'])}</b>\n{DIV}\n"
         f"📦 <b>Size:</b> <code>{h(movie['size'])}</code>\n"
         f"🎞 <b>Quality:</b> <code>{h(movie['quality'])}</code>\n"
     )
@@ -316,38 +520,23 @@ async def post_public(bot, movie: dict) -> int:
         caption += f"{meta}\n"
     if movie.get("genres"):
         caption += f"🏷 <i>{h(', '.join(movie['genres']))}</i>\n"
-    caption += (
-        f"{DIV}\n"
-        f"⬇️ <b>Download</b> — button dabayein, link bot mein milega."
-    )
-    kb = (
-        InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ DOWNLOAD", url=deep)]])
-        if deep else None
-    )
+    caption += f"{DIV}\n⬇️ <b>Download</b> — button dabayein, link bot mein milega."
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ DOWNLOAD", url=deep)]]) if deep else None
     image = movie.get("backdrop") or movie.get("poster")
     if image:
-        m = await bot.send_photo(
-            PUBLIC_CHANNEL_ID, photo=image, caption=frame(caption),
-            parse_mode=ParseMode.HTML, reply_markup=kb,
-        )
+        m = await bot.send_photo(PUBLIC_CHANNEL_ID, photo=image, caption=frame(caption),
+                                 parse_mode=ParseMode.HTML, reply_markup=kb)
     else:
-        m = await bot.send_message(
-            PUBLIC_CHANNEL_ID, frame(caption),
-            parse_mode=ParseMode.HTML, reply_markup=kb,
-        )
+        m = await bot.send_message(PUBLIC_CHANNEL_ID, frame(caption),
+                                   parse_mode=ParseMode.HTML, reply_markup=kb)
     return m.message_id
 
 
 async def log_entry(bot, movie: dict) -> int:
-    text = (
-        "#MOVIE v2\n"
-        f"ID: {movie['id']}\n"
-        f"NAME: {movie['name']}\n"
-        f"LINK: {movie['link']}\n"
-        f"SIZE: {movie['size']}\n"
-        f"QUALITY: {movie['quality']}\n"
-        f"POSTER: {movie['poster'] or '-'}"
-    )
+    text = ("#MOVIE v2\n"
+            f"ID: {movie['id']}\nNAME: {movie['name']}\nLINK: {movie['link']}\n"
+            f"SIZE: {movie['size']}\nQUALITY: {movie['quality']}\n"
+            f"POSTER: {movie['poster'] or '-'}")
     m = await bot.send_message(PRIVATE_CHANNEL_ID, text)
     return m.message_id
 
@@ -357,6 +546,7 @@ async def log_entry(bot, movie: dict) -> int:
 # ═══════════════════════════════════════════════════════════════
 
 async def op_add(data: dict) -> dict:
+    guard_or_raise()
     fields, err = clean_fields(data)
     if err:
         raise ValueError(err)
@@ -364,7 +554,6 @@ async def op_add(data: dict) -> dict:
     movie = {"id": mid, **fields, "created": now(),
              "log_msg_id": None, "public_msg_id": None}
     DB["movies"][mid] = movie
-
     warns = []
     if LOG_ENTRIES and PRIVATE_CHANNEL_ID:
         try:
@@ -378,11 +567,12 @@ async def op_add(data: dict) -> dict:
             warns.append(f"Channel post: {exc}")
     st = await save_snapshot(BOT)
     if not st.get("ok"):
-        warns.append(st.get("error") or "Snapshot pin nahi hua")
+        warns.append(st.get("error") or "Save issue")
     return {"movie": movie, "warnings": warns}
 
 
 async def op_update(data: dict) -> dict:
+    guard_or_raise()
     mid = str(data.get("id", "")).strip()
     movie = DB["movies"].get(mid)
     if not movie:
@@ -392,18 +582,18 @@ async def op_update(data: dict) -> dict:
         raise ValueError(err)
     movie.update(fields)
     movie["updated"] = now()
-    warns = []
     st = await save_snapshot(BOT)
-    if not st.get("ok"):
-        warns.append(st.get("error") or "Snapshot pin nahi hua")
+    warns = [] if st.get("ok") else [st.get("error") or "Save issue"]
     return {"movie": movie, "warnings": warns}
 
 
 async def op_delete(data: dict) -> dict:
+    guard_or_raise()
     mid = str(data.get("id", "")).strip()
     movie = DB["movies"].pop(mid, None)
     if not movie:
         raise ValueError("ID nahi mili")
+    LOAD["authorized_loss"] += 1
     warns = []
     for key, chat_id in (("log_msg_id", PRIVATE_CHANNEL_ID),
                          ("public_msg_id", PUBLIC_CHANNEL_ID)):
@@ -415,11 +605,12 @@ async def op_delete(data: dict) -> dict:
                 warns.append(f"{key} delete: {exc}")
     st = await save_snapshot(BOT)
     if not st.get("ok"):
-        warns.append(st.get("error") or "Snapshot pin nahi hua")
+        warns.append(st.get("error") or "Save issue")
     return {"id": mid, "warnings": warns}
 
 
 async def op_repost(data: dict) -> dict:
+    guard_or_raise()
     mid = str(data.get("id", "")).strip()
     movie = DB["movies"].get(mid)
     if not movie:
@@ -450,8 +641,7 @@ async def op_import(text: str) -> dict:
     existed = mid in DB["movies"]
     movie = DB["movies"].get(mid)
     if not movie:
-        movie = {"id": mid, "created": now(),
-                 "log_msg_id": None, "public_msg_id": None}
+        movie = {"id": mid, "created": now(), "log_msg_id": None, "public_msg_id": None}
         for k, v in DEFAULTS.items():
             movie.setdefault(k, v() if callable(v) else v)
     movie.update({
@@ -460,7 +650,9 @@ async def op_import(text: str) -> dict:
         "poster": "" if poster in ("-", "") else poster,
     })
     DB["movies"][mid] = movie
-    schedule_save()
+    if LOAD["state"] == "failed":
+        LOAD.update({"state": "ok", "baseline": len(DB["movies"]), "authorized_loss": 0})
+    await save_snapshot(BOT)
     return {"id": mid, "updated": existed}
 
 
@@ -510,7 +702,7 @@ def req_auth():
     return validate_init_data(init_data)
 
 
-def bot_call(coro, timeout=60):
+def bot_call(coro, timeout=90):
     if MAIN_LOOP is None:
         raise RuntimeError("Bot loop ready nahi hai")
     return asyncio.run_coroutine_threadsafe(coro, MAIN_LOOP).result(timeout)
@@ -525,11 +717,9 @@ async def check_membership(bot, user_id: int) -> bool:
         return True
     try:
         member = await bot.get_chat_member(PUBLIC_CHANNEL_ID, user_id)
-        return member.status in (
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        )
+        return member.status in (ChatMemberStatus.MEMBER,
+                                 ChatMemberStatus.ADMINISTRATOR,
+                                 ChatMemberStatus.OWNER)
     except Exception as exc:
         print("[membership]", exc)
         return False
@@ -548,7 +738,7 @@ async def get_channel_link(bot) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-#  FLASK — MINI APP + API (unchanged)
+#  FLASK
 # ═══════════════════════════════════════════════════════════════
 
 app = Flask(__name__)
@@ -568,7 +758,8 @@ def mini_app():
 
 @app.route("/health")
 def health():
-    return f"OK movies={len(DB['movies'])} storage={'ok' if STORAGE['ok'] else 'warn'}", 200
+    return (f"OK movies={len(DB['movies'])} load={LOAD['state']} "
+            f"baseline={LOAD['baseline']}"), 200
 
 
 @app.route("/api/movies")
@@ -577,7 +768,8 @@ def api_movies():
     items.sort(key=lambda x: x.get("created", 0), reverse=True)
     genres = sorted({g for m in items for g in m.get("genres", [])})
     return jsonify({"ok": True, "brand": BRAND, "bot": BOT_USERNAME,
-                    "count": len(items), "genres": genres, "movies": items})
+                    "count": len(items), "genres": genres, "movies": items,
+                    "load_state": LOAD["state"]})
 
 
 @app.route("/api/session", methods=["POST"])
@@ -602,8 +794,7 @@ def api_access():
     if err:
         return jsonify({"ok": False, "error": err}), 401
     body = request.get_json(silent=True) or {}
-    mid = str(body.get("id", "")).strip()
-    movie = DB["movies"].get(mid)
+    movie = DB["movies"].get(str(body.get("id", "")).strip())
     if not movie:
         return jsonify({"ok": False, "error": "Title library mein nahi mila"}), 404
     uid = int(auth["user"]["id"])
@@ -613,8 +804,8 @@ def api_access():
     except Exception as exc:
         return jsonify({"ok": False, "error": f"Membership check fail: {exc}"}), 503
     if not is_member:
-        return jsonify({"ok": True, "granted": False,
-                        "need_join": True, "join_url": join_url})
+        return jsonify({"ok": True, "granted": False, "need_join": True,
+                        "join_url": join_url})
     return jsonify({"ok": True, "granted": True, "link": movie["link"],
                     "name": movie["name"], "size": movie["size"],
                     "quality": movie["quality"]})
@@ -635,7 +826,11 @@ def api_admin_status():
     if err_resp:
         return err_resp
     return jsonify({
-        "ok": True, "titles": len(DB["movies"]), "storage": STORAGE,
+        "ok": True, "titles": len(DB["movies"]),
+        "storage": {"ok": LOAD["state"] == "ok" and not LOAD["error"],
+                    "source": LOAD["source"], "saved_at": LOAD["saved_at"],
+                    "error": LOAD["error"], "state": LOAD["state"],
+                    "baseline": LOAD["baseline"]},
         "movies_count": sum(1 for m in DB["movies"].values() if m.get("type") == "movie"),
         "series_count": sum(1 for m in DB["movies"].values() if m.get("type") == "series"),
         "public_channel": bool(PUBLIC_CHANNEL_ID),
@@ -659,7 +854,7 @@ def _mutate(op):
         return err_resp
     body = request.get_json(silent=True) or {}
     try:
-        result = bot_call(op(body), timeout=90)
+        result = bot_call(op(body), timeout=120)
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     except Exception as exc:
@@ -693,131 +888,100 @@ def run_flask():
 
 
 # ═══════════════════════════════════════════════════════════════
-#  BOT — MESSAGE TEMPLATES
+#  MESSAGE TEMPLATES
 # ═══════════════════════════════════════════════════════════════
 
-def welcome_text(first_name: str) -> str:
+def welcome_text(first_name):
     return (
-        f"🎬 <b>{h(BRAND.upper())}</b>\n"
-        f"{DIV}\n"
+        f"🎬 <b>{h(BRAND.upper())}</b>\n{DIV}\n"
         f"👋 Welcome, <b>{h(first_name)}</b>!\n\n"
         f"Aapki premium movie library — <b>movies, series aur direct "
         f"download links</b>, bina kisi wait ke.\n\n"
-        f"<blockquote>⚡ Instant downloads\n"
-        f"🎞 HD • 4K quality\n"
-        f"🆕 Regular updates\n"
-        f"🔒 Members-only access</blockquote>\n\n"
+        f"<blockquote>⚡ Instant downloads\n🎞 HD • 4K quality\n"
+        f"🆕 Regular updates\n🔒 Members-only access</blockquote>\n\n"
         f"👇 App kholen ya channel library browse karein."
     )
 
 
-def welcome_kb(channel_link: str) -> InlineKeyboardMarkup:
+def welcome_kb(channel_link):
     rows = []
     if WEB_APP_URL:
-        rows.append([InlineKeyboardButton(
-            "🎬 Open KNL Movies App", web_app=WebAppInfo(url=WEB_APP_URL))])
-    rows.append([InlineKeyboardButton(
-        "📚 Browse Movies Library", url=channel_link)])
+        rows.append([InlineKeyboardButton("🎬 Open KNL Movies App",
+                                          web_app=WebAppInfo(url=WEB_APP_URL))])
+    rows.append([InlineKeyboardButton("📚 Browse Movies Library", url=channel_link)])
     return InlineKeyboardMarkup(rows)
 
 
-def join_gate_text(movie: dict = None) -> str:
-    head = (
-        f"🔒 <b>MEMBERS ONLY ACCESS</b>\n"
-        f"{DIV}\n"
-    )
+def join_gate_text(movie=None):
+    head = f"🔒 <b>MEMBERS ONLY ACCESS</b>\n{DIV}\n"
     if movie:
         head += f"🎬 <b>{h(movie['name'])}</b> aapke liye ready hai.\n\n"
-    return (
-        head +
-        f"Library sirf channel members ke liye unlock hoti hai.\n\n"
-        f"<b>Unlock kaise karein:</b>\n"
-        f"1️⃣ <b>Join Channel</b> dabayein\n"
-        f"2️⃣ Channel join karein\n"
-        f"3️⃣ Wapas aakar <b>✅ I Joined</b> dabayein\n\n"
-        f"<blockquote>⚡ Join karte hi poori library instant unlock</blockquote>"
-    )
+    return (head +
+            f"Library sirf channel members ke liye unlock hoti hai.\n\n"
+            f"<b>Unlock kaise karein:</b>\n"
+            f"1️⃣ <b>Join Channel</b> dabayein\n"
+            f"2️⃣ Channel join karein\n"
+            f"3️⃣ Wapas aakar <b>✅ I Joined</b> dabayein\n\n"
+            f"<blockquote>⚡ Join karte hi poori library instant unlock</blockquote>")
 
 
-def join_gate_kb(channel_link: str, ctx: str) -> InlineKeyboardMarkup:
+def join_gate_kb(channel_link, ctx):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📢 Join Channel", url=channel_link)],
         [InlineKeyboardButton("✅ I Joined", callback_data=f"joinok_{ctx}")],
     ])
 
 
-def download_card(movie: dict) -> str:
+def download_card(movie):
     meta = movie_meta_line(movie)
-    text = (
-        f"🎬 <b>{h(movie['name'])}</b>\n"
-        f"{DIV}\n"
-        f"📦 <b>Size:</b> <code>{h(movie.get('size', '-'))}</code>\n"
-        f"🎞 <b>Quality:</b> <code>{h(movie.get('quality', '-'))}</code>\n"
-    )
+    text = (f"🎬 <b>{h(movie['name'])}</b>\n{DIV}\n"
+            f"📦 <b>Size:</b> <code>{h(movie.get('size', '-'))}</code>\n"
+            f"🎞 <b>Quality:</b> <code>{h(movie.get('quality', '-'))}</code>\n")
     if meta:
         text += f"{meta}\n"
     if movie.get("genres"):
         text += f"🏷 <i>{h(', '.join(movie['genres']))}</i>\n"
-    text += (
-        f"{DIV}\n"
-        f"✅ <b>Access granted</b> — download link ready hai.\n\n"
-        f"<blockquote>⬇️ Neeche button se download shuru karein</blockquote>"
-    )
+    text += (f"{DIV}\n✅ <b>Access granted</b> — download link ready hai.\n\n"
+             f"<blockquote>⬇️ Neeche button se download shuru karein</blockquote>")
     return text
 
 
-def unavailable_text() -> str:
-    return (
-        f"⚠️ <b>CONTENT UNAVAILABLE</b>\n"
-        f"{DIV}\n"
-        f"Yeh title abhi library mein nahi mila — ho sakta hai remove ho gaya ho.\n\n"
-        f"<blockquote>📚 Channel mein latest titles dekhein</blockquote>"
-    )
+def unavailable_text():
+    return (f"⚠️ <b>CONTENT UNAVAILABLE</b>\n{DIV}\n"
+            f"Yeh title abhi library mein nahi mila — ho sakta hai remove ho gaya ho.\n\n"
+            f"<blockquote>📚 Channel mein latest titles dekhein</blockquote>")
 
 
-# ═══════════════════════════════════════════════════════════════
-#  BOT — SEND HELPERS
-# ═══════════════════════════════════════════════════════════════
-
-async def reply(update: Update, text: str, kb=None):
+async def reply(update, text, kb=None):
     await update.effective_message.reply_text(
         frame(text), parse_mode=ParseMode.HTML, reply_markup=kb,
-        disable_web_page_preview=True,
-    )
+        disable_web_page_preview=True)
 
 
-async def edit(update: Update, text: str, kb=None):
+async def edit(update, text, kb=None):
     await update.callback_query.edit_message_text(
         frame(text), parse_mode=ParseMode.HTML, reply_markup=kb,
-        disable_web_page_preview=True,
-    )
+        disable_web_page_preview=True)
 
 
-async def show_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE, via_edit=False):
+async def show_welcome(update, context, via_edit=False):
     link = await get_channel_link(context.bot)
-    text = welcome_text(update.effective_user.first_name or "Member")
-    kb = welcome_kb(link)
-    if via_edit:
-        await edit(update, text, kb)
-    else:
-        await reply(update, text, kb)
+    text, kb = welcome_text(update.effective_user.first_name or "Member"), welcome_kb(link)
+    await (edit(update, text, kb) if via_edit else reply(update, text, kb))
 
 
-async def show_download(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                        movie: dict, via_edit=False):
+async def show_download(update, context, movie, via_edit=False):
     link = await get_channel_link(context.bot)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⬇️ Download Now", url=movie["link"])],
         [InlineKeyboardButton("📚 Browse Movies Library", url=link)],
     ])
-    if via_edit:
-        await edit(update, download_card(movie), kb)
-    else:
-        await reply(update, download_card(movie), kb)
+    await (edit(update, download_card(movie), kb) if via_edit
+           else reply(update, download_card(movie), kb))
 
 
 # ═══════════════════════════════════════════════════════════════
-#  BOT — USER FLOW
+#  USER FLOW
 # ═══════════════════════════════════════════════════════════════
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -833,8 +997,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             movie = DB["movies"].get(mid)
             if not movie:
                 link = await get_channel_link(context.bot)
-                await reply(update, unavailable_text(), InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📚 Browse Movies Library", url=link)]]))
+                await reply(update, unavailable_text(), InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("📚 Browse Movies Library", url=link)]]))
                 return
             if not member:
                 link = await get_channel_link(context.bot)
@@ -846,7 +1010,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await render_list(update, context)
             return
 
-    # Normal /start
     if not member:
         link = await get_channel_link(context.bot)
         await reply(update, join_gate_text(), join_gate_kb(link, "home"))
@@ -858,47 +1021,34 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_message:
         return
     await reply(update, (
-        f"❓ <b>HELP — {h(BRAND.upper())}</b>\n"
-        f"{DIV}\n"
+        f"❓ <b>HELP — {h(BRAND.upper())}</b>\n{DIV}\n"
         f"<b>Download kaise karein:</b>\n"
         f"1️⃣ App ya channel se title chunein\n"
         f"2️⃣ Channel join karein (agar nahi kiya)\n"
         f"3️⃣ Download link turant mil jayega\n\n"
-        f"<blockquote>📚 Library: /movies\n"
-        f"🎬 App: /start ke baad button</blockquote>"
-    ))
+        f"<blockquote>📚 Library: /movies</blockquote>"))
 
 
 async def render_list(update: Update, context: ContextTypes.DEFAULT_TYPE, via_edit=False):
     movies = DB["movies"]
     link = await get_channel_link(context.bot)
     if not movies:
-        text = (
-            f"📭 <b>LIBRARY EMPTY</b>\n{DIV}\n"
-            f"Abhi koi title available nahi — admin jald hi add karega."
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📚 Browse Movies Library", url=link)]])
-        if via_edit:
-            await edit(update, text, kb)
-        else:
-            await reply(update, text, kb)
+        text = (f"📭 <b>LIBRARY EMPTY</b>\n{DIV}\n"
+                f"Abhi koi title available nahi.")
+        if LOAD["state"] == "failed":
+            text += f"\n\n<blockquote>🚨 Data load nahi hua — admin /recover chalaye</blockquote>"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Browse Movies Library", url=link)]])
+        await (edit(update, text, kb) if via_edit else reply(update, text, kb))
         return
-
     items = sorted(movies.values(), key=lambda x: x.get("created", 0), reverse=True)
     buttons = [[InlineKeyboardButton(f"🎬 {m['name'][:38]}", callback_data=f"open_{m['id']}")]
                for m in items[:40]]
     buttons.append([InlineKeyboardButton("📚 Browse Movies Library", url=link)])
-    text = (
-        f"📚 <b>{h(BRAND.upper())} — LIBRARY</b>\n{DIV}\n"
-        f"<blockquote>🎞 {len(movies)} titles available</blockquote>\n"
-        f"👇 Title select karein"
-    )
+    text = (f"📚 <b>{h(BRAND.upper())} — LIBRARY</b>\n{DIV}\n"
+            f"<blockquote>🎞 {len(movies)} titles available</blockquote>\n"
+            f"👇 Title select karein")
     kb = InlineKeyboardMarkup(buttons)
-    if via_edit:
-        await edit(update, text, kb)
-    else:
-        await reply(update, text, kb)
+    await (edit(update, text, kb) if via_edit else reply(update, text, kb))
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -911,7 +1061,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("joinok_"):
         ctx = data[len("joinok_"):]
         if not await check_membership(context.bot, uid):
-            await query.answer("❌ Abhi join nahi hua — pehle Join Channel dabayein", show_alert=True)
+            await query.answer("❌ Abhi join nahi hua — pehle Join Channel dabayein",
+                               show_alert=True)
             return
         await query.answer("✅ Membership confirmed")
         if ctx == "home":
@@ -925,15 +1076,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("open_"):
-        mid = data[len("open_"):]
-        movie = DB["movies"].get(mid)
+        movie = DB["movies"].get(data[len("open_"):])
         if not movie:
             await query.answer("⚠️ Title nahi mila", show_alert=True)
             return
         if not await check_membership(context.bot, uid):
             link = await get_channel_link(context.bot)
             await query.answer()
-            await edit(update, join_gate_text(movie), join_gate_kb(link, mid))
+            await edit(update, join_gate_text(movie), join_gate_kb(link, movie["id"]))
             return
         await query.answer("✅ Access granted")
         await show_download(update, context, movie, via_edit=True)
@@ -948,7 +1098,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  BOT — ADMIN
+#  ADMIN COMMANDS
 # ═══════════════════════════════════════════════════════════════
 
 PIPE_FIELDS = ["name", "link", "size", "quality", "poster", "backdrop",
@@ -956,51 +1106,43 @@ PIPE_FIELDS = ["name", "link", "size", "quality", "poster", "backdrop",
                "language", "age", "cast", "description"]
 
 
+def is_admin(update):
+    return update.effective_user and update.effective_user.id in ADMIN_IDS
+
+
 async def add_movie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_message:
         return
-    if update.effective_user.id not in ADMIN_IDS:
-        await reply(update, "⛔ <b>ADMIN ONLY</b>\n" + DIV + "\nYeh command sirf admin ke liye hai.")
+    if not is_admin(update):
+        await reply(update, f"⛔ <b>ADMIN ONLY</b>\n{DIV}\nYeh command sirf admin ke liye hai.")
         return
-
     raw = (update.effective_message.text or "").split(maxsplit=1)
     if len(raw) < 2 or "|" not in raw[1]:
         await reply(update, (
             f"➕ <b>ADD TITLE</b>\n{DIV}\n"
-            f"<b>Quick add:</b>\n"
             f"<code>/addmovie Name | link | size | quality | poster</code>\n\n"
-            f"<blockquote>Full metadata (genre, rating, cast, backdrop) ke liye "
-            f"mini app ka Admin panel use karein — ya /addjson.</blockquote>"
-        ))
+            f"<blockquote>Full metadata ke liye mini app ka Admin panel use karein.</blockquote>"))
         return
-
     parts = [p.strip() for p in raw[1].split("|")]
     if len(parts) < 4:
-        await reply(update, f"⚠️ <b>INVALID FORMAT</b>\n{DIV}\n4 fields chahiye: Name | link | size | quality")
+        await reply(update, f"⚠️ <b>INVALID FORMAT</b>\n{DIV}\nName | link | size | quality")
         return
-
     data = {k: parts[i] for i, k in enumerate(PIPE_FIELDS) if i < len(parts)}
     data["post"] = True
     try:
         res = await op_add(data)
     except Exception as exc:
-        await reply(update, f"⚠️ <b>ERROR</b>\n{DIV}\n<code>{h(exc)}</code>")
+        await reply(update, f"🛑 <b>BLOCKED / ERROR</b>\n{DIV}\n<code>{h(exc)}</code>")
         return
-
     m = res["movie"]
-    warn = ""
-    if res["warnings"]:
-        warn = "\n\n<blockquote>⚠️ " + h("\n⚠️ ".join(res["warnings"])) + "</blockquote>"
-    await reply(update, (
-        f"✅ <b>TITLE ADDED</b>\n{DIV}\n"
-        f"🎬 <b>{h(m['name'])}</b>\n"
-        f"🔖 ID: <code>{m['id']}</code>\n"
-        f"<blockquote>💾 Database saved\n📢 Channel post done</blockquote>{warn}"
-    ))
+    warn = ("\n\n<blockquote>⚠️ " + h("\n⚠️ ".join(res["warnings"])) + "</blockquote>") if res["warnings"] else ""
+    await reply(update, (f"✅ <b>TITLE ADDED</b>\n{DIV}\n🎬 <b>{h(m['name'])}</b>\n"
+                         f"🔖 ID: <code>{m['id']}</code>\n"
+                         f"<blockquote>💾 Saved &amp; verified\n📢 Channel post done</blockquote>{warn}"))
 
 
 async def add_json_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_message or update.effective_user.id not in ADMIN_IDS:
+    if not update.effective_message or not is_admin(update):
         return
     raw = (update.effective_message.text or "").split(maxsplit=1)
     if len(raw) < 2:
@@ -1015,17 +1157,17 @@ async def add_json_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         res = await op_add(data)
     except Exception as exc:
-        await reply(update, f"⚠️ <b>ERROR</b>\n{DIV}\n<code>{h(exc)}</code>")
+        await reply(update, f"🛑 <b>BLOCKED / ERROR</b>\n{DIV}\n<code>{h(exc)}</code>")
         return
     await reply(update, f"✅ <b>ADDED</b>\n{DIV}\n🔖 <code>{res['movie']['id']}</code>")
 
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_message or update.effective_user.id not in ADMIN_IDS:
+    if not update.effective_message or not is_admin(update):
         return
     movies = DB["movies"]
     if not movies:
-        await reply(update, f"📭 <b>LIBRARY EMPTY</b>\n{DIV}\nKoi title nahi.")
+        await reply(update, f"📭 <b>LIBRARY EMPTY</b>\n{DIV}\nLoad state: <code>{LOAD['state']}</code>")
         return
     lines = [f"🗂 <b>DATABASE — {len(movies)} TITLES</b>\n{DIV}"]
     for m in sorted(movies.values(), key=lambda x: x.get("created", 0), reverse=True)[:60]:
@@ -1034,7 +1176,7 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_message or update.effective_user.id not in ADMIN_IDS:
+    if not update.effective_message or not is_admin(update):
         return
     if not context.args:
         await reply(update, f"🗑 <b>DELETE</b>\n{DIV}\n<code>/delmovie &lt;id&gt;</code>")
@@ -1042,46 +1184,111 @@ async def del_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         res = await op_delete({"id": context.args[0]})
     except Exception as exc:
-        await reply(update, f"⚠️ <b>ERROR</b>\n{DIV}\n<code>{h(exc)}</code>")
+        await reply(update, f"🛑 <b>BLOCKED / ERROR</b>\n{DIV}\n<code>{h(exc)}</code>")
         return
     await reply(update, f"🗑 <b>REMOVED</b>\n{DIV}\n🔖 <code>{res['id']}</code>")
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_message or update.effective_user.id not in ADMIN_IDS:
+    if not update.effective_message or not is_admin(update):
         return
-    saved = (time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(STORAGE["saved_at"]))
-             if STORAGE["saved_at"] else "—")
+    saved = (time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(LOAD["saved_at"]))
+             if LOAD["saved_at"] else "—")
+    icon = {"ok": "✅", "fresh": "🆕", "failed": "🚨", "boot": "⏳"}.get(LOAD["state"], "❓")
     await reply(update, (
         f"📊 <b>SYSTEM STATUS</b>\n{DIV}\n"
         f"🎬 Titles: <code>{len(DB['movies'])}</code>\n"
-        f"💾 Storage: {'✅ OK' if STORAGE['ok'] else '⚠️ Problem'}\n"
+        f"🛡 Load: {icon} <code>{LOAD['state']}</code>\n"
+        f"📐 Baseline: <code>{LOAD['baseline']}</code>\n"
+        f"✍️ Writes: <code>{'allowed' if writable()[0] else 'BLOCKED'}</code>\n"
         f"🕒 Last save: <code>{saved}</code>\n"
-        f"📌 Source: <code>{STORAGE['source']}</code>\n"
-        f"🌐 App URL: <code>{h(WEB_APP_URL or 'set nahi')}</code>"
-        + (f"\n<blockquote>⚠️ {h(STORAGE['error'])}</blockquote>" if STORAGE["error"] else "")
-    ))
+        f"📌 Pointer: <code>{LOAD['msg_id'] or '—'}</code>\n"
+        f"🌐 App: <code>{h(WEB_APP_URL or 'set nahi')}</code>"
+        + (f"\n<blockquote>⚠️ {h(LOAD['error'])}</blockquote>" if LOAD["error"] else "")))
 
 
 async def save_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_message or update.effective_user.id not in ADMIN_IDS:
+    if not update.effective_message or not is_admin(update):
         return
-    st = await save_snapshot(context.bot)
+    force = bool(context.args and context.args[0].lower() == "force")
+    st = await save_snapshot(context.bot, force=force)
+    if st.get("ok"):
+        await reply(update, (
+            f"✅ <b>SNAPSHOT SAVED</b>\n{DIV}\n"
+            f"🎬 Titles: <code>{len(DB['movies'])}</code>\n"
+            f"📌 Pin: {'✅' if st.get('pinned') else '❌'}  "
+            f"📝 Description: {'✅' if st.get('description') else '❌'}\n"
+            f"<blockquote>Purane snapshots delete nahi hue — archive safe hai.</blockquote>"))
+    else:
+        await reply(update, (
+            f"🛑 <b>SAVE BLOCKED</b>\n{DIV}\n{h(st.get('error', 'unknown'))}\n\n"
+            f"<blockquote>Data loss rok diya gaya.\n"
+            f"/recover chalao, ya janbujh kar kam karna hai to /save force</blockquote>"))
+
+
+async def recover_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_message or not is_admin(update):
+        return
+    await reply(update, f"🔎 <b>RECOVERING…</b>\n{DIV}\nPointers scan ho rahe hain…")
+    before = len(DB["movies"])
+    st = await load_snapshot(context.bot, announce=False)
+    if st["state"] == "ok":
+        await reply(update, (
+            f"✅ <b>RECOVERED</b>\n{DIV}\n"
+            f"🎬 Titles: <code>{len(DB['movies'])}</code> (pehle {before})\n"
+            f"📌 Source: <code>{st['source']}</code>\n"
+            f"<blockquote>Ab writes allowed hain. /save se confirm kar lo.</blockquote>"))
+        return
     await reply(update, (
-        f"{'✅' if st['ok'] else '⚠️'} <b>SNAPSHOT SAVE</b>\n{DIV}\n"
-        f"🎬 Titles: <code>{len(DB['movies'])}</code>\n"
-        f"<blockquote>{h(st.get('error') or 'Pinned + saved')}</blockquote>"
-    ))
+        f"🚨 <b>AUTO-RECOVER FAIL</b>\n{DIV}\n{h(st['error'])}\n\n"
+        f"<b>Manual restore (100% kaam karta hai):</b>\n"
+        f"1️⃣ Private database channel kholo\n"
+        f"2️⃣ Koi bhi purana <code>library.json</code> dhoondo\n"
+        f"3️⃣ Usko is bot mein <b>forward</b> kar do\n\n"
+        f"<blockquote>Bot us file se poora data restore kar dega.\n"
+        f"Backup DM mein bhi library.json milega.</blockquote>"))
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_message or not is_admin(update):
+        return
+    if not DB["movies"]:
+        await reply(update, f"📭 <b>NOTHING TO BACKUP</b>\n{DIV}\nLibrary khali hai.")
+        return
+    await dm_backup(context.bot)
+    LOAD["last_backup"] = len(DB["movies"])
+    await reply(update, (f"📦 <b>BACKUP SENT</b>\n{DIV}\n"
+                         f"🎬 {len(DB['movies'])} titles\n"
+                         f"<blockquote>File DM mein aa gayi. Isko safe rakho — "
+                         f"kabhi bhi forward karke restore kar sakte ho.</blockquote>"))
 
 
 async def import_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if not msg or not update.effective_user:
+    if not msg or not is_admin(update):
         return
     if update.effective_chat.type != ChatType.PRIVATE:
         return
-    if update.effective_user.id not in ADMIN_IDS:
-        return
+
+    # Forwarded library.json → full restore
+    if msg.document:
+        fname = (msg.document.file_name or "").lower()
+        cap = (msg.caption or "").strip()
+        if fname.endswith(".json") or cap.startswith(SNAP_MARK):
+            try:
+                payload = await _download_doc(context.bot, msg.document)
+                res = await restore_payload(context.bot, payload, fname or "document")
+            except Exception as exc:
+                await reply(update, f"⚠️ <b>RESTORE FAIL</b>\n{DIV}\n<code>{h(exc)}</code>")
+                return
+            sv = res["save"]
+            await reply(update, (
+                f"♻️ <b>DATABASE RESTORED</b>\n{DIV}\n"
+                f"🎬 Titles: <code>{res['restored']}</code> (pehle {res['before']})\n"
+                f"💾 Save: {'✅ verified' if sv.get('ok') else '⚠️ ' + h(sv.get('error', ''))}\n"
+                f"<blockquote>Ab /list se check karo. Data permanent save ho gaya.</blockquote>"))
+            return
+
     text = (msg.text or "").strip()
     if not text.startswith("#MOVIE"):
         return
@@ -1090,10 +1297,9 @@ async def import_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as exc:
         await reply(update, f"⚠️ <b>IMPORT FAIL</b>\n{DIV}\n<code>{h(exc)}</code>")
         return
-    await reply(update, (
-        f"{'🔄' if res['updated'] else '✅'} <b>{'UPDATED' if res['updated'] else 'IMPORTED'}</b>\n"
-        f"{DIV}\n🔖 <code>{res['id']}</code>"
-    ))
+    await reply(update, (f"{'🔄' if res['updated'] else '✅'} "
+                         f"<b>{'UPDATED' if res['updated'] else 'IMPORTED'}</b>\n"
+                         f"{DIV}\n🔖 <code>{res['id']}</code>"))
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1116,20 +1322,26 @@ async def post_init(application: Application):
     BOT = application.bot
     MAIN_LOOP = asyncio.get_running_loop()
     _save_lock = asyncio.Lock()
-    await load_snapshot(application.bot)
 
-    if not STORAGE["ok"]:
+    st = await load_snapshot(application.bot, announce=False)
+    print(f"[boot] load={st['state']} titles={len(DB['movies'])}")
+
+    if st["state"] == "failed":
+        await alert_admins(
+            f"🚨 <b>DATA PROTECTION ACTIVE</b>\n{DIV}\n{h(st['error'])}\n\n"
+            f"<blockquote>Bot koi write nahi karega — purana data safe hai.\n\n"
+            f"1️⃣ /recover chalao\n"
+            f"2️⃣ Ya private channel se purana <code>library.json</code> "
+            f"yahan forward kar do</blockquote>")
+    elif st["state"] == "ok":
         for aid in ADMIN_IDS:
             try:
                 await application.bot.send_message(
-                    aid,
-                    frame(
-                        f"⚠️ <b>STORAGE WARNING</b>\n{DIV}\n{h(STORAGE['error'])}\n\n"
-                        f"<blockquote>Fix: bot ko private channel mein Pin Messages aur "
-                        f"Delete Messages rights do, phir /save bhejo.\n\n"
-                        f"Purani movies wapas laane ke liye unke #MOVIE messages "
-                        f"yahan forward kar do.</blockquote>"
-                    ), parse_mode=ParseMode.HTML)
+                    aid, frame(f"✅ <b>{h(BRAND.upper())} ONLINE</b>\n{DIV}\n"
+                               f"🎬 Titles: <code>{len(DB['movies'])}</code>\n"
+                               f"📌 Source: <code>{st['source']}</code>\n"
+                               f"<blockquote>Data loaded &amp; write-protected.</blockquote>"),
+                    parse_mode=ParseMode.HTML)
             except Exception:
                 pass
 
@@ -1137,14 +1349,13 @@ async def post_init(application: Application):
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN set nahi hai")
-
     try:
         asyncio.get_event_loop()
     except RuntimeError:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
     threading.Thread(target=run_flask, daemon=True).start()
-    print(f"[boot] flask port {os.environ.get('PORT', '5000')} | admins={sorted(ADMIN_IDS)} | app={WEB_APP_URL or 'none'}")
+    print(f"[boot] flask port {os.environ.get('PORT', '5000')} | admins={sorted(ADMIN_IDS)}")
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     application.add_handler(CommandHandler("start", start))
@@ -1156,8 +1367,11 @@ def main():
     application.add_handler(CommandHandler("delmovie", del_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(CommandHandler("save", save_cmd))
+    application.add_handler(CommandHandler("recover", recover_cmd))
+    application.add_handler(CommandHandler("backup", backup_cmd))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, import_handler))
+    application.add_handler(MessageHandler(
+        (filters.TEXT | filters.Document.ALL) & ~filters.COMMAND, import_handler))
     application.add_error_handler(error_handler)
 
     print("[boot] polling started")
