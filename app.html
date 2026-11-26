@@ -102,7 +102,7 @@ button:disabled{opacity:.55;cursor:default}
 .chip.sm{padding:6px 14px;font-size:12px}
 
 /* ══════════ HERO ══════════ */
-.hero{position:relative;height:86vh;max-height:700px;min-height:520px;overflow:hidden}
+.hero{position:relative;width:100%;aspect-ratio:16/9;overflow:hidden}
 .hero-slide{position:absolute;top:0;right:0;bottom:0;left:0;opacity:0;transition:opacity 1s ease;pointer-events:none}
 .hero-slide.active{opacity:1;pointer-events:auto}
 .hero-slide img{width:100%;height:100%;object-fit:cover;transform:scale(1.1);transition:transform 8s ease-out;will-change:transform}
@@ -364,11 +364,6 @@ mark{background:rgba(255,122,0,.3);color:inherit;border-radius:5px;padding:0 2px
 .pmeta{font-size:12.5px;color:var(--muted);margin-top:6px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .ptag{font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;padding:3px 9px;border-radius:99px;
   background:rgba(255,122,0,.16);color:var(--accent);border:1px solid rgba(255,122,0,.35)}
-.pact{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:18px}
-.pact button{display:inline-flex;align-items:center;gap:7px;padding:10px 16px;font-size:12.5px;font-weight:600;
-  border-radius:999px;border:1px solid var(--gborder);background:var(--chipbg);color:var(--text);cursor:pointer;
-  transition:transform .45s var(--spring),color .3s,background .3s}
-.pact button:hover{transform:translateY(-2px) scale(1.05);color:var(--accent)}
 .fld{margin-bottom:13px}
 .fld>label{display:block;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
 .fld input,.fld textarea{width:100%;padding:12px 15px;border-radius:16px;background:var(--chipbg);border:1px solid var(--gborder);
@@ -378,10 +373,6 @@ mark{background:rgba(255,122,0,.3);color:inherit;border-radius:5px;padding:0 2px
 .fld textarea{resize:vertical;min-height:84px;line-height:1.6}
 .f2{display:grid;grid-template-columns:1fr 1fr;gap:11px}
 .f3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:11px}
-.more-toggle{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--accent);background:none;border:none;cursor:pointer;padding:4px 0 12px}
-.more-body{display:grid;grid-template-rows:0fr;transition:grid-template-rows .7s var(--smooth)}
-.more-body.open{grid-template-rows:1fr}
-.more-in{overflow:hidden;min-height:0}
 .chk{display:flex;align-items:center;gap:10px;font-size:13px;font-weight:500;cursor:pointer;margin:6px 0 14px}
 .chk input{width:20px;height:20px;accent-color:var(--accent)}
 .aprev{width:84px;aspect-ratio:2/3;border-radius:14px;overflow:hidden;background:var(--surface2);margin-top:9px;position:relative;display:none;box-shadow:var(--shadow)}
@@ -482,6 +473,15 @@ mark{background:rgba(255,122,0,.3);color:inherit;border-radius:5px;padding:0 2px
   .md\:text-6xl{font-size:3.75rem;line-height:1}.md\:text-7xl{font-size:4.5rem;line-height:1}
   .md\:text-8xl{font-size:6rem;line-height:1}.md\:text-base{font-size:1rem;line-height:1.5rem}
   .md\:grid-cols-\[1fr_250px\]{grid-template-columns:1fr 250px}
+}
+@media (max-width:640px){
+  .hero .hero-content{padding-top:0}
+  .hero .hero-content h1{font-size:2.15rem;line-height:1.05}
+  .hero .hero-content p{display:none}
+  .hero .hero-content .mb-3{margin-bottom:6px}
+  .hero .hero-content .mt-4{margin-top:8px}
+  .hero .hero-content .mt-6{margin-top:12px}
+  .hero .hero-content .btn-primary,.hero .hero-content .btn-ghost{padding-top:10px;padding-bottom:10px}
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 </style>
@@ -865,8 +865,6 @@ function renderProfile(){
   var uname=u.username?'@'+u.username:(tgUser&&tgUser.username?'@'+tgUser.username:'');
   var uid=u.id||(tgUser&&tgUser.id)||'';
   var saved=list.map(byId).filter(Boolean);
-  var movies=M.filter(function(m){return m.type==='movie';}).length;
-  var series=M.filter(function(m){return m.type==='series';}).length;
   var h='<div class="pcard glass">'+
     '<div class="pav">'+(u.photo?'<img src="'+esc(u.photo)+'" alt="'+esc(name)+'" onerror="this.style.display=\'none\'">':esc((name||'K').charAt(0).toUpperCase()))+'</div>'+
     '<div class="min-w-0">'+
@@ -877,16 +875,7 @@ function renderProfile(){
       '</div>'+
       (USER?'':'<div class="pmeta"><span>Profile Telegram ke andar kholein — details verify hongi.</span></div>')+
     '</div></div>'+
-    '<div class="astat">'+
-      '<div class="glass" style="--i:0"><div class="v">'+saved.length+'</div><div class="k">My List</div></div>'+
-      '<div class="glass" style="--i:1"><div class="v">'+movies+'</div><div class="k">Movies</div></div>'+
-      '<div class="glass" style="--i:2"><div class="v">'+series+'</div><div class="k">Series</div></div></div>'+
-    '<div class="pact">'+
-      '<button onclick="scrollToList()">'+ico('heart',15)+' My List</button>'+
-      (BOTUSER?'<button onclick="openTg(\'https://t.me/'+esc(BOTUSER)+'\')">'+ico('send',15)+' Bot</button>':'')+
-      '<button onclick="shareApp()">'+ico('arrowUL',15)+' Share</button>'+
-      (IS_ADMIN?'<button onclick="setView(\'admin\')">'+ico('sliders',15)+' Admin</button>':'')+
-    '</div>'+
+    (IS_ADMIN?'<button class="btn-primary w-full py-3.5 mb-5 flex items-center justify-center gap-2" onclick="setView(\'admin\')">'+ico('sliders',18)+' Admin Panel</button>':'')+
     '<div class="apanel glass" id="pListPanel"><h3>'+ico('heart',18)+' Saved Titles ('+saved.length+')</h3>'+
       (saved.length?'<div class="grid-cards stag">'+saved.map(function(m,i){return card(m,{i:i});}).join('')+'</div>'
         :'<div class="empty-s" style="padding:14px 6px"><div class="em">'+ico('heart',34)+'</div>'+
@@ -903,16 +892,6 @@ function renderProfile(){
       '</div></div>';
   box.innerHTML=h;
   observeReveals();
-}
-function scrollToList(){
-  hap('light');
-  var el=document.getElementById('pListPanel');
-  if(el)el.scrollIntoView({behavior:'smooth',block:'start'});
-}
-function shareApp(){
-  hap('light');
-  var url=(location.origin||'')+'/';
-  openTg('https://t.me/share/url?url='+encodeURIComponent(url)+'&text='+encodeURIComponent('KNL Movies — premium movies & series library'));
 }
 
 function setView(v){
@@ -1332,7 +1311,6 @@ document.addEventListener('click',function(e){
       else if(f==='rating')S.rating=+v;else S[f]=v;
       renderSearchUI();break;}
     case 'atype':A.type=v;hap('select');paintAdminForm();break;
-    case 'more':A.moreOpen=!A.moreOpen;hap('select');paintAdminForm();break;
     case 'asave':adminSave();break;
     case 'acancel':adminReset();break;
     case 'aedit':adminEdit(v);break;
@@ -1360,7 +1338,7 @@ function bindSearchInputs(){
 }
 
 /* ══════════ ADMIN ══════════ */
-var A={status:null,movies:[],editing:null,moreOpen:false,type:'movie',q:'',busy:false,loaded:false};
+var A={status:null,movies:[],editing:null,type:'movie',q:'',busy:false,loaded:false};
 var AF=['name','link','size','quality','poster','backdrop','genres','year','rating','duration','language','age','cast','description'];
 function adminFormHTML(){
   var m=A.editing?A.movies.filter(function(x){return x.id===A.editing;})[0]:null;
@@ -1375,8 +1353,6 @@ function adminFormHTML(){
       '<button class="chip sm '+(A.type==='series'?'active':'')+'" data-act="atype" data-v="series">Series</button></div></div>'+
     '<div class="fld"><label>Poster URL</label><input id="a_poster" value="'+val('poster')+'" placeholder="https://image.tmdb.org/…jpg">'+
       '<div class="aprev '+(m&&m.poster?'show':'')+'" id="a_prev"><div class="ph">'+ico('movies',22)+'</div><img id="a_previmg" '+(m&&m.poster?'src="'+esc(m.poster)+'"':'')+' onerror="this.style.display=\'none\'"></div></div>'+
-    '<button class="more-toggle" data-act="more">'+ico(A.moreOpen?'chevUp':'chevD',15)+' '+(A.moreOpen?'Hide':'More')+' details (genre, rating, cast…)</button>'+
-    '<div class="more-body '+(A.moreOpen?'open':'')+'"><div class="more-in">'+
       '<div class="fld"><label>Backdrop URL (wide image)</label><input id="a_backdrop" value="'+val('backdrop')+'" placeholder="https://…jpg"></div>'+
       '<div class="fld"><label>Genres (comma separated)</label><input id="a_genres" value="'+val('genres')+'" placeholder="Action, Thriller"></div>'+
       '<div class="f3"><div class="fld"><label>Year</label><input id="a_year" value="'+val('year')+'" placeholder="2025" inputmode="numeric"></div>'+
@@ -1386,7 +1362,6 @@ function adminFormHTML(){
       '<div class="fld"><label>Language</label><input id="a_language" value="'+val('language')+'" placeholder="Hindi • English"></div></div>'+
       '<div class="fld"><label>Cast (comma separated)</label><input id="a_cast" value="'+val('cast')+'" placeholder="Actor One, Actor Two"></div>'+
       '<div class="fld"><label>Description</label><textarea id="a_description" placeholder="Short plot / details…">'+val('description')+'</textarea></div>'+
-    '</div></div>'+
     '<label class="chk"><input type="checkbox" id="a_post" '+(A.editing?'':'checked')+'> Channel par post karo</label>'+
     '<button class="btn-primary w-full py-3.5 flex items-center justify-center gap-2" data-act="asave" '+(A.busy?'disabled':'')+'>'+ico(A.editing?'save':'plus',18)+' '+(A.busy?'Saving…':(A.editing?'Update Title':'Add Title'))+'</button>'+
     (A.editing?'<button class="btn-ghost dark w-full mt-2 py-3 flex items-center justify-center gap-2" data-act="acancel">'+ico('x',16)+' Cancel edit</button>':'')+
@@ -1450,10 +1425,10 @@ function paintAdmin(){
     window._aqt=setTimeout(function(){var b=E('aListBox');if(b)b.innerHTML=adminListHTML();},140);
   });
 }
-function adminReset(){A.editing=null;A.type='movie';A.moreOpen=false;hap('light');paintAdminForm();}
+function adminReset(){A.editing=null;A.type='movie';hap('light');paintAdminForm();}
 function adminEdit(id){
   var m=A.movies.filter(function(x){return x.id===id;})[0];if(!m)return;
-  A.editing=id;A.type=m.type||'movie';A.moreOpen=true;hap('select');paintAdminForm();
+  A.editing=id;A.type=m.type||'movie';hap('select');paintAdminForm();
   var box=E('aFormBox');if(box)box.scrollIntoView({behavior:'smooth',block:'start'});
 }
 function adminSave(){
@@ -1468,7 +1443,7 @@ function adminSave(){
   p.then(function(d){
     hap('ok');toast(A.editing?'Title updated':'Title added');
     if(d.warnings&&d.warnings.length)setTimeout(function(){toast('⚠ '+d.warnings[0]);},2500);
-    A.editing=null;A.moreOpen=false;A.type='movie';
+    A.editing=null;A.type='movie';
     return Promise.all([api('/api/admin/status'),api('/api/admin/movies')]);
   }).then(function(r){
     A.status=r[0];A.movies=r[1].movies||[];A.busy=false;paintAdmin();return loadCatalog(true);
@@ -1596,13 +1571,6 @@ loadCatalog(false).then(function(){bootDone=true;}).catch(function(e){bootDone=t
 if(INIT){
   api('/api/session').then(function(s){
     IS_ADMIN=!!s.is_admin;USER=s.user||null;
-    if(IS_ADMIN){
-      var dk=document.createElement('button');
-      dk.className='dk';dk.setAttribute('data-view','admin');dk.setAttribute('aria-label','Admin');
-      dk.innerHTML=ico('sliders',23)+'<span class="dk-l">Admin</span>';
-      dk.onclick=function(){setView('admin');};
-      E('dock').appendChild(dk);
-    }
     if(USER){
       var av=E('avatar');
       if(USER.photo)av.innerHTML='<img src="'+esc(USER.photo)+'" class="w-full h-full object-cover" alt="">';
