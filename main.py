@@ -14,6 +14,7 @@ from urllib.parse import parse_qsl
 from flask import Flask, jsonify, request
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.constants import ChatMemberStatus, ChatType, ParseMode
+from telegram.error import Conflict
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1303,7 +1304,15 @@ async def import_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print("[error]", context.error)
+    err = context.error
+    if isinstance(err, Conflict):
+        # Same BOT_TOKEN se doosra process getUpdates kar raha hai (purana
+        # deploy, duplicate service, ya local run). Bot khud retry karta
+        # rehta hai, isliye admin ko har baar alert nahi bhejte.
+        print("[poll] CONFLICT: same BOT_TOKEN se dusra bot instance chal raha "
+              "hai — purana deploy/process band karein")
+        return
+    print("[error]", err)
     for aid in ADMIN_IDS:
         try:
             await context.bot.send_message(
@@ -1322,6 +1331,13 @@ async def post_init(application: Application):
     BOT = application.bot
     MAIN_LOOP = asyncio.get_running_loop()
     _save_lock = asyncio.Lock()
+
+    # Polling se pehle koi webhook set ho to hata do, warna bot updates
+    # receive nahi kar payega.
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception as exc:
+        print("[boot] webhook clear fail:", exc)
 
     st = await load_snapshot(application.bot, announce=False)
     print(f"[boot] load={st['state']} titles={len(DB['movies'])}")
@@ -1375,7 +1391,9 @@ def main():
     application.add_error_handler(error_handler)
 
     print("[boot] polling started")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(allowed_updates=Update.ALL_TYPES,
+                            drop_pending_updates=True,
+                            poll_interval=1.0, timeout=30)
 
 
 if __name__ == "__main__":
