@@ -102,7 +102,7 @@ button:disabled{opacity:.55;cursor:default}
 .chip.sm{padding:6px 14px;font-size:12px}
 
 /* ══════════ HERO ══════════ */
-.hero{position:relative;width:100%;aspect-ratio:16/9;overflow:hidden}
+.hero{position:relative;width:100%;aspect-ratio:1/1;max-height:min(94vh,900px);overflow:hidden}
 .hero-slide{position:absolute;top:0;right:0;bottom:0;left:0;opacity:0;transition:opacity 1s ease;pointer-events:none}
 .hero-slide.active{opacity:1;pointer-events:auto}
 .hero-slide img{width:100%;height:100%;object-fit:cover;transform:scale(1.1);transition:transform 8s ease-out;will-change:transform}
@@ -476,12 +476,7 @@ mark{background:rgba(255,122,0,.3);color:inherit;border-radius:5px;padding:0 2px
 }
 @media (max-width:640px){
   .hero .hero-content{padding-top:0}
-  .hero .hero-content h1{font-size:2.15rem;line-height:1.05}
-  .hero .hero-content p{display:none}
-  .hero .hero-content .mb-3{margin-bottom:6px}
-  .hero .hero-content .mt-4{margin-top:8px}
-  .hero .hero-content .mt-6{margin-top:12px}
-  .hero .hero-content .btn-primary,.hero .hero-content .btn-ghost{padding-top:10px;padding-bottom:10px}
+  .hero .hero-content h1{font-size:2.9rem;line-height:1}
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
 </style>
@@ -556,6 +551,7 @@ mark{background:rgba(255,122,0,.3);color:inherit;border-radius:5px;padding:0 2px
 
   <!-- ADMIN -->
   <section id="adminView" class="hidden pt-24 max-w-[1100px] mx-auto px-4 md:px-8">
+    <button class="btn-ghost dark px-4 py-2 text-sm mb-4" onclick="setView('home')">← Home</button>
     <h1 class="display text-5xl md:text-6xl mb-1">Admin</h1>
     <p class="text-sm mb-5" style="color:var(--muted)">Library manage karein — add, edit, repost, delete</p>
     <div id="adminBody"></div>
@@ -811,6 +807,7 @@ function render(){
   E('adminView').classList.toggle('hidden',!showAdmin);
   E('profileView').classList.toggle('hidden',!showProfile);
   E('browseView').classList.toggle('hidden',!browsing);
+  E('dock').classList.toggle('hidden',showAdmin);
   E('chipsHome').innerHTML=chipsHTML();
   E('chipsBrowse').innerHTML=chipsHTML();
   updateListCount();
