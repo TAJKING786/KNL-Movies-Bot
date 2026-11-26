@@ -353,6 +353,22 @@ mark{background:rgba(255,122,0,.3);color:inherit;border-radius:5px;padding:0 2px
 .astat .k{font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-top:5px}
 .apanel{border-radius:26px;padding:18px;margin-bottom:18px}
 .apanel h3{font-weight:700;font-size:16px;display:flex;align-items:center;gap:9px;margin-bottom:16px}
+
+/* ══════════ PROFILE ══════════ */
+.pcard{border-radius:28px;padding:20px;margin-bottom:18px;display:flex;align-items:center;gap:16px;animation:bubble .6s var(--spring)}
+.pav{width:76px;height:76px;border-radius:26px;flex:none;display:grid;place-items:center;overflow:hidden;
+  background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;font-weight:800;font-size:30px;
+  box-shadow:0 12px 28px rgba(255,122,0,.35),inset 0 1px 1px rgba(255,255,255,.55)}
+.pav img{width:100%;height:100%;object-fit:cover}
+.pname{font-size:22px;font-weight:800;line-height:1.15;word-break:break-word}
+.pmeta{font-size:12.5px;color:var(--muted);margin-top:6px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.ptag{font-size:10px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;padding:3px 9px;border-radius:99px;
+  background:rgba(255,122,0,.16);color:var(--accent);border:1px solid rgba(255,122,0,.35)}
+.pact{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:18px}
+.pact button{display:inline-flex;align-items:center;gap:7px;padding:10px 16px;font-size:12.5px;font-weight:600;
+  border-radius:999px;border:1px solid var(--gborder);background:var(--chipbg);color:var(--text);cursor:pointer;
+  transition:transform .45s var(--spring),color .3s,background .3s}
+.pact button:hover{transform:translateY(-2px) scale(1.05);color:var(--accent)}
 .fld{margin-bottom:13px}
 .fld>label{display:block;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
 .fld input,.fld textarea{width:100%;padding:12px 15px;border-radius:16px;background:var(--chipbg);border:1px solid var(--gborder);
@@ -545,6 +561,13 @@ mark{background:rgba(255,122,0,.3);color:inherit;border-radius:5px;padding:0 2px
     <div id="adminBody"></div>
   </section>
 
+  <!-- PROFILE -->
+  <section id="profileView" class="hidden pt-24 max-w-[1100px] mx-auto px-4 md:px-8">
+    <h1 class="display text-5xl md:text-6xl mb-1">Profile</h1>
+    <p class="text-sm mb-5" style="color:var(--muted)">Aapki details, saved titles aur app info</p>
+    <div id="profileBody"></div>
+  </section>
+
   <footer class="max-w-[1500px] mx-auto px-4 md:px-8 mt-10 pt-8 border-t">
     <div class="flex flex-wrap items-center justify-between gap-4">
       <span class="display text-3xl">KNL<span style="color:var(--accent)">Movies</span></span>
@@ -552,7 +575,7 @@ mark{background:rgba(255,122,0,.3);color:inherit;border-radius:5px;padding:0 2px
         <a href="#" onclick="setView('home');return false" class="hover:text-[var(--accent)]">Home</a>
         <a href="#" onclick="setView('movies');return false" class="hover:text-[var(--accent)]">Movies</a>
         <a href="#" onclick="setView('series');return false" class="hover:text-[var(--accent)]">Series</a>
-        <a href="#" onclick="setView('list');return false" class="hover:text-[var(--accent)]">My List</a>
+        <a href="#" onclick="setView('profile');return false" class="hover:text-[var(--accent)]">Profile</a>
       </div>
     </div>
     <p class="text-xs mt-4" style="color:var(--muted)">© KNL Movies • Members only • Instant download</p>
@@ -565,7 +588,7 @@ mark{background:rgba(255,122,0,.3);color:inherit;border-radius:5px;padding:0 2px
   <button class="dk" data-view="movies" onclick="setView('movies')" aria-label="Movies"><i data-ic="movies" data-s="23"></i><span class="dk-l">Movies</span></button>
   <button class="dk" data-view="search" onclick="setView('search')" aria-label="Search"><i data-ic="search" data-s="23"></i><span class="dk-l">Search</span></button>
   <button class="dk" data-view="series" onclick="setView('series')" aria-label="Series"><i data-ic="series" data-s="23"></i><span class="dk-l">Series</span></button>
-  <button class="dk" data-view="list" onclick="setView('list')" aria-label="My List"><i data-ic="heart" data-s="23"></i><span class="dk-l">My List</span><b id="listCount" class="dk-badge">0</b></button>
+  <button class="dk" data-view="profile" onclick="setView('profile')" aria-label="Profile"><i data-ic="user" data-s="23"></i><span class="dk-l">Profile</span><b id="listCount" class="dk-badge">0</b></button>
 </nav>
 
 <!-- SEARCH SHELL -->
@@ -650,7 +673,7 @@ function hap(k){try{if(!tg||!tg.HapticFeedback)return;
   else tg.HapticFeedback.impactOccurred(k||'light');}catch(e){}}
 function openExternal(u){if(!u)return;try{if(tg&&tg.openLink)tg.openLink(u);else window.location.href=u;}catch(e){window.location.href=u;}}
 function openTg(u){if(!u)return;try{if(tg&&tg.openTelegramLink)tg.openTelegramLink(u);else window.location.href=u;}catch(e){window.location.href=u;}}
-function syncBack(){if(!tg||!tg.BackButton)return;var need=!!(currentModal||shOpen||view==='admin');
+function syncBack(){if(!tg||!tg.BackButton)return;var need=!!(currentModal||shOpen||view==='admin'||view==='profile');
   try{need?tg.BackButton.show():tg.BackButton.hide();}catch(e){}}
 function onBack(){if(currentModal)closeModal();else if(shOpen)closeSearch();else if(view!=='home')setView('home');}
 
@@ -781,10 +804,12 @@ function render(){
   var showHome=view==='home'&&genre==='All';
   var showSearch=view==='search';
   var showAdmin=view==='admin';
-  var browsing=!showHome&&!showSearch&&!showAdmin;
+  var showProfile=view==='profile';
+  var browsing=!showHome&&!showSearch&&!showAdmin&&!showProfile;
   E('homeView').classList.toggle('hidden',!showHome);
   E('searchView').classList.toggle('hidden',!showSearch);
   E('adminView').classList.toggle('hidden',!showAdmin);
+  E('profileView').classList.toggle('hidden',!showProfile);
   E('browseView').classList.toggle('hidden',!browsing);
   E('chipsHome').innerHTML=chipsHTML();
   E('chipsBrowse').innerHTML=chipsHTML();
@@ -811,26 +836,85 @@ function render(){
     var items=M.filter(function(m){return genre==='All'||(m.genres||[]).indexOf(genre)>-1;});
     if(view==='movies')items=items.filter(function(m){return m.type==='movie';});
     if(view==='series')items=items.filter(function(m){return m.type==='series';});
-    if(view==='list')items=items.filter(function(m){return inList(m.id);});
-    var titles={home:genre,movies:'Movies',series:'Series',list:'My List'};
+    var titles={home:genre,movies:'Movies',series:'Series'};
     E('browseTitle').textContent=titles[view]||'Browse';
     E('browseSub').textContent=items.length+' title'+(items.length===1?'':'s')+(genre!=='All'&&view!=='home'?' • '+genre:'');
     E('grid').innerHTML=items.map(function(m,i){return card(m,{i:i});}).join('');
     var isEmpty=!items.length;
     E('empty').classList.toggle('hidden',!isEmpty);
     if(isEmpty){
-      E('emptyTitle').textContent=view==='list'?'Nothing here yet':'Koi title nahi mila';
-      E('emptyMsg').textContent=view==='list'?'Kisi bhi title par + dabakar apni list banayein.':'Filter badal kar dekhein.';
+      E('emptyTitle').textContent='Koi title nahi mila';
+      E('emptyMsg').textContent='Filter badal kar dekhein.';
     }
   }
   if(showSearch)renderSearchUI();
   if(showAdmin)renderAdmin();
+  if(showProfile)renderProfile();
   syncBack();
 }
 function animateView(){
   var el=['homeView','searchView','browseView','adminView'].map(E).filter(function(e){return e&&!e.classList.contains('hidden');})[0];
   if(el){el.classList.remove('view-in');void el.offsetWidth;el.classList.add('view-in');}
 }
+/* ══════════ PROFILE ══════════ */
+function renderProfile(){
+  var box=E('profileBody');if(!box)return;
+  var u=USER||{};
+  var tgUser=(tg&&tg.initDataUnsafe&&tg.initDataUnsafe.user)?tg.initDataUnsafe.user:null;
+  var name=u.name||(tgUser&&tgUser.first_name)||'Guest';
+  var uname=u.username?'@'+u.username:(tgUser&&tgUser.username?'@'+tgUser.username:'');
+  var uid=u.id||(tgUser&&tgUser.id)||'';
+  var saved=list.map(byId).filter(Boolean);
+  var movies=M.filter(function(m){return m.type==='movie';}).length;
+  var series=M.filter(function(m){return m.type==='series';}).length;
+  var h='<div class="pcard glass">'+
+    '<div class="pav">'+(u.photo?'<img src="'+esc(u.photo)+'" alt="'+esc(name)+'" onerror="this.style.display=\'none\'">':esc((name||'K').charAt(0).toUpperCase()))+'</div>'+
+    '<div class="min-w-0">'+
+      '<div class="pname">'+esc(name)+'</div>'+
+      '<div class="pmeta"><span class="ptag">'+(IS_ADMIN?'Admin':(USER?'Member':'Guest'))+'</span>'+
+        (uname?'<span>'+esc(uname)+'</span>':'')+
+        (uid?'<span>ID '+esc(uid)+'</span>':'')+
+      '</div>'+
+      (USER?'':'<div class="pmeta"><span>Profile Telegram ke andar kholein — details verify hongi.</span></div>')+
+    '</div></div>'+
+    '<div class="astat">'+
+      '<div class="glass" style="--i:0"><div class="v">'+saved.length+'</div><div class="k">My List</div></div>'+
+      '<div class="glass" style="--i:1"><div class="v">'+movies+'</div><div class="k">Movies</div></div>'+
+      '<div class="glass" style="--i:2"><div class="v">'+series+'</div><div class="k">Series</div></div></div>'+
+    '<div class="pact">'+
+      '<button onclick="scrollToList()">'+ico('heart',15)+' My List</button>'+
+      (BOTUSER?'<button onclick="openTg(\'https://t.me/'+esc(BOTUSER)+'\')">'+ico('send',15)+' Bot</button>':'')+
+      '<button onclick="shareApp()">'+ico('arrowUL',15)+' Share</button>'+
+      (IS_ADMIN?'<button onclick="setView(\'admin\')">'+ico('sliders',15)+' Admin</button>':'')+
+    '</div>'+
+    '<div class="apanel glass" id="pListPanel"><h3>'+ico('heart',18)+' Saved Titles ('+saved.length+')</h3>'+
+      (saved.length?'<div class="grid-cards stag">'+saved.map(function(m,i){return card(m,{i:i});}).join('')+'</div>'
+        :'<div class="empty-s" style="padding:14px 6px"><div class="em">'+ico('heart',34)+'</div>'+
+          '<p class="font-semibold">List khali hai</p>'+
+          '<p class="text-sm mt-1" style="color:var(--muted)">Kisi bhi title par + dabakar apni list banayein.</p>'+
+          '<button class="btn-primary mt-4 px-6 py-2.5 text-sm" onclick="setView(\'movies\')">Browse Movies</button></div>')+
+    '</div>'+
+    '<div class="apanel glass"><h3>'+ico('info',18)+' App info</h3>'+
+      '<div class="text-sm space-y-2" style="color:var(--muted)">'+
+        '<p><span style="color:var(--text)" class="font-semibold">Library:</span> '+M.length+' titles</p>'+
+        (BOTUSER?'<p><span style="color:var(--text)" class="font-semibold">Bot:</span> @'+esc(BOTUSER)+'</p>':'')+
+        '<p><span style="color:var(--text)" class="font-semibold">Access:</span> Channel members only</p>'+
+        '<p><span style="color:var(--text)" class="font-semibold">Theme:</span> '+(document.documentElement.getAttribute('data-theme')==='light'?'Light':'Dark')+'</p>'+
+      '</div></div>';
+  box.innerHTML=h;
+  observeReveals();
+}
+function scrollToList(){
+  hap('light');
+  var el=document.getElementById('pListPanel');
+  if(el)el.scrollIntoView({behavior:'smooth',block:'start'});
+}
+function shareApp(){
+  hap('light');
+  var url=(location.origin||'')+'/';
+  openTg('https://t.me/share/url?url='+encodeURIComponent(url)+'&text='+encodeURIComponent('KNL Movies — premium movies & series library'));
+}
+
 function setView(v){
   if(v==='admin'&&!IS_ADMIN)return;
   if(shOpen)closeSearch();
@@ -860,7 +944,7 @@ function toggleList(id){
   updateListCount();
   var lb=E('listCount');lb.classList.remove('bump');void lb.offsetWidth;lb.classList.add('bump');
   syncHearts(id);
-  if(view==='list')render();
+  if(view==='profile')renderProfile();
   var mb=E('mdList');if(mb&&currentModal)mb.innerHTML=mdListHTML(currentModal);
 }
 var toastT;
@@ -1524,6 +1608,9 @@ if(INIT){
       if(USER.photo)av.innerHTML='<img src="'+esc(USER.photo)+'" class="w-full h-full object-cover" alt="">';
       else av.textContent=(USER.name||'K').charAt(0).toUpperCase();
     }
+    av.onclick=function(){setView('profile');};
+    av.style.cursor='pointer';
+    if(view==='profile')renderProfile();
   }).catch(function(){IS_ADMIN=false;});
 }else{IS_ADMIN=false;}
 </script>
